@@ -1,0 +1,84 @@
+# ---------------------------------------------------------------------------
+# Delhi Bus Network - three tiers, three services.
+#
+#   loader  data plane   one-shot: GTFS static .txt -> SQLite, then exits
+#   api     service tier FastAPI + the 30s realtime poller
+#   web     UI tier      nginx serving the React bundle and fronting the API
+#
+# Start:  docker compose up -d --build      then open http://localhost:8080
+# ---------------------------------------------------------------------------
+
+name: delhi-gtfs
+
+services:
+  # Builds the database before the API is allowed to start. Idempotent, so it
+  # is cheap on every boot after the first; set GTFS_FORCE_RELOAD=1 to rebuild.
+  loader:
+    build:
+      context: ./backend
+    image: delhi-gtfs-api:latest
+    command: ["load"]
+    environment:
+      DB_PATH: /data/gtfs.db
+      GTFS_STATIC_DIR: /gtfs
+      GTFS_FORCE_RELOAD: ${GTFS_FORCE_RELOAD:-0}
+    volumes:
+      - gtfs-data:/data
+      - ${GTFS_STATIC_DIR:-./delhi_buses_static_gtfs_v1-2}:/gtfs:ro
+    restart: "no"
+
+  api:
+    build:
+      context: ./backend
+    image: delhi-gtfs-api:latest
+    depends_on:
+      loader:
+        condition: service_completed_successfully
+    # App configuration, later file wins. Secrets live here, never in the
+    # image. Do NOT restate these keys under `environment:` - an unset
+    # ${VAR:-} there resolves to an empty string and silently overrides the
+    # file, which is how you end up running the mock feed by accident.
+    env_file:
+      - path: ./backend/.env
+        required: false
+      - path: ./.env
+        required: false
+    environment:
+      # Container paths only. `environment` outranks `env_file`, which is what
+      # makes these win over any host-oriented value in a .env.
+      DB_PATH: /data/gtfs.db
+      GTFS_STATIC_DIR: /gtfs
+    volumes:
+      - gtfs-data:/data
+      - ${GTFS_STATIC_DIR:-./delhi_buses_static_gtfs_v1-2}:/gtfs:ro
+    expose:
+      - "8000"
+    # Published only when you need to reach the API directly; the UI does not
+    # require it, since nginx proxies /api and /ws.
+    ports:
+      - "${API_PORT:-127.0.0.1:8000}:8000"
+    restart: unless-stopped
+    stop_grace_period: 20s
+    # Docker's default json-file driver is unbounded; this poller runs
+    # continuously, so cap it.
+    logging: &logging
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+
+  web:
+    build:
+      context: ./frontend
+    image: delhi-gtfs-web:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  # The SQLite database. Realtime history lives here and grows with retention,
+  # so keep it on a volume rather than in the container's writable layer.
+  gtfs-data:
