@@ -4,6 +4,10 @@ import react from '@vitejs/plugin-react'
 // The service tier runs on :8000. Proxying keeps the browser same-origin, so
 // there is no CORS dance and the websocket URL is just /ws/vehicles.
 export default defineConfig({
+  // Deployed behind https://fis-buyer-staging.ondc.org/gtfs/ — that proxy
+  // forwards the path as-is (no prefix stripping), so the app has to know
+  // it lives under /gtfs/ and emit every asset/API/ws URL accordingly.
+  base: '/gtfs/',
   plugins: [react()],
   // MapLibre ships its own web worker and builds the URL at runtime, so no
   // bundler can see it statically. Two separate problems follow:
@@ -19,8 +23,19 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: 'http://127.0.0.1:8000', changeOrigin: true },
-      '/ws': { target: 'ws://127.0.0.1:8000', ws: true },
+      // The dev server itself serves under /gtfs/ once `base` is set, so
+      // fetches from the app land here as /gtfs/api/... — strip the prefix
+      // before forwarding to the API tier, which knows nothing about it.
+      '/gtfs/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/gtfs/, ''),
+      },
+      '/gtfs/ws': {
+        target: 'ws://127.0.0.1:8000',
+        ws: true,
+        rewrite: (path) => path.replace(/^\/gtfs/, ''),
+      },
     },
   },
 })

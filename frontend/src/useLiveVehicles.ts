@@ -79,7 +79,8 @@ export function useLiveVehicles() {
     const connect = () => {
       if (closedRef.current) return
       const proto = window.location.protocol === 'https:' ? 'wss' : 'ws'
-      const ws = new WebSocket(`${proto}://${window.location.host}/ws/vehicles`)
+      const base = import.meta.env.BASE_URL.replace(/\/$/, '') // '/gtfs' in prod, '' in dev
+      const ws = new WebSocket(`${proto}://${window.location.host}${base}/ws/vehicles`)
       wsRef.current = ws
 
       ws.onopen = () => { retryRef.current = 0; setConnection('live') }

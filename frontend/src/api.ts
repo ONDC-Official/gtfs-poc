@@ -4,8 +4,13 @@ import type {
   Overview, PollLog, RouteStop, RouteSummary, SpeedBin, TopRoute, Vehicle,
 } from './types'
 
+// BASE_URL is '/gtfs/' in production (see vite.config.ts), '/' in dev.
+// Every call below writes an absolute '/api/...' path for readability;
+// this is the one place that adjusts it for wherever the app is mounted.
+const API_ROOT = import.meta.env.BASE_URL.replace(/\/$/, '')
+
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(path)
+  const res = await fetch(API_ROOT + path)
   if (!res.ok) throw new Error(`${res.status} ${res.statusText} on ${path}`)
   return res.json() as Promise<T>
 }
