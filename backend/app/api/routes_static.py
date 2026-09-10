@@ -20,6 +20,28 @@ def list_routes(q: Optional[str] = None,
     return deps.repository.list_routes(q, limit, offset)
 
 
+# MUST stay above /routes/{route_id}: FastAPI matches in declaration order, so
+# below it this path binds as route_id="nearby" and 404s with no error to trace.
+@router.get("/routes/nearby")
+def routes_nearby(lat: float = Query(..., ge=-90, le=90),
+                  lon: float = Query(..., ge=-180, le=180),
+                  radius_m: int = Query(500, ge=1, le=5000),
+                  limit: int = Query(50, ge=1, le=200)):
+    """Routes serving any stop within `radius_m` of the point, nearest first.
+
+    An empty `items` means nothing is in range - that is an answer, not an
+    error. The 503 is the different case: nothing can be in range because the
+    schedule was never loaded.
+    """
+    if deps.repository.route_count() == 0:
+        raise HTTPException(
+            503, "static GTFS feed not loaded - run backend/scripts/load_static.py "
+                 "before calling this endpoint")
+    items = deps.repository.routes_nearby(lat, lon, radius_m, limit)
+    return {"lat": lat, "lon": lon, "radius_m": radius_m,
+            "count": len(items), "items": items}
+
+
 @router.get("/routes/{route_id}")
 def get_route(route_id: str):
     route = deps.repository.get_route(route_id)

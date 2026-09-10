@@ -1,4 +1,5 @@
 """SQLite implementation of the data-plane port."""
+import math
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -9,6 +10,12 @@ _VEHICLE_COLS = (
     "vehicle_id, ts, trip_id, route_id, lat, lon, bearing, speed, stop_id, "
     "current_status, congestion_level, occupancy_status, ingested_at"
 )
+
+# One degree of latitude in metres. Longitude is this scaled by cos(lat).
+_M_PER_DEG = 111_320.0
+
+# SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds; chunk well under it.
+_PARAM_CHUNK = 500
 
 
 def _rows(cur) -> List[Dict[str, Any]]:
@@ -116,6 +123,77 @@ class SqliteRepository(Repository):
             "WHERE st.stop_id=? AND st.departure_s BETWEEN ? AND ? "
             "ORDER BY st.departure_s LIMIT ?", (stop_id, from_s, to_s, limit)))
 
+    def routes_nearby(self, lat: float, lon: float, radius_m: float,
+                      limit: int) -> List[Dict[str, Any]]:
+        c = db.get_connection()
+
+        # Equirectangular approximation: exact enough at city scale and, unlike
+        # haversine, it reduces to plain arithmetic. cos(lat) is computed once
+        # here rather than in SQL because SQLite's math functions are a
+        # compile-time flag - fine on this build, not safe to assume in the
+        # container image.
+        coslat = max(math.cos(math.radians(lat)), 1e-9)
+        dlat = radius_m / _M_PER_DEG
+        dlon = radius_m / (_M_PER_DEG * coslat)
+
+        # Bounding box first, so ix_stops_latlon does the elimination and the
+        # distance maths only runs over the handful of candidates left.
+        near: Dict[str, Any] = {}
+        for s in c.execute(
+            "SELECT stop_id, stop_name, stop_lat, stop_lon FROM gtfs_stops "
+            "WHERE stop_lat BETWEEN ? AND ? AND stop_lon BETWEEN ? AND ?",
+            (lat - dlat, lat + dlat, lon - dlon, lon + dlon),
+        ):
+            dy = (s["stop_lat"] - lat) * _M_PER_DEG
+            dx = (s["stop_lon"] - lon) * _M_PER_DEG * coslat
+            d = math.hypot(dx, dy)
+            # The box circumscribes the circle, so trim the corners.
+            if d <= radius_m:
+                near[s["stop_id"]] = (s["stop_name"], d)
+
+        if not near:
+            return []
+
+        # A stop carries one stop_times row per trip serving it, so DISTINCT
+        # collapses a busy interchange to its handful of actual routes.
+        stop_ids = list(near)
+        out: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(stop_ids), _PARAM_CHUNK):
+            chunk = stop_ids[i:i + _PARAM_CHUNK]
+            marks = ",".join("?" * len(chunk))
+            for row in c.execute(
+                "SELECT DISTINCT st.stop_id, t.route_id, ro.route_short_name, "
+                "ro.route_long_name, ro.agency_id "
+                "FROM gtfs_stop_times st "
+                "JOIN gtfs_trips t ON t.trip_id = st.trip_id "
+                "LEFT JOIN gtfs_routes ro ON ro.route_id = t.route_id "
+                "WHERE st.stop_id IN (" + marks + ")", chunk,
+            ):
+                rid = row["route_id"]
+                if not rid:
+                    continue
+                stop_name, dist = near[row["stop_id"]]
+                entry = out.get(rid)
+                if entry is None:
+                    entry = out[rid] = {
+                        "route_id": rid,
+                        "short_name": row["route_short_name"],
+                        "long_name": row["route_long_name"],
+                        "agency_id": row["agency_id"],
+                        "stops": [],
+                        "distance_m": dist,
+                    }
+                # The route's distance is to the CLOSEST stop that serves it.
+                elif dist < entry["distance_m"]:
+                    entry["distance_m"] = dist
+                if stop_name and stop_name not in entry["stops"]:
+                    entry["stops"].append(stop_name)
+
+        items = sorted(out.values(), key=lambda e: e["distance_m"])[:limit]
+        for e in items:
+            e["distance_m"] = round(e["distance_m"], 1)
+        return items
+
     def route_names(self, route_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         ids = [r for r in route_ids if r]
         if not ids:
@@ -183,11 +261,19 @@ class SqliteRepository(Repository):
         return _rows(c.execute(
             "SELECT " + _VEHICLE_COLS + " FROM rt_vehicle_latest " + where, params))
 
-    def vehicle_history(self, vehicle_id: str, since_ts: int) -> List[Dict[str, Any]]:
+    def vehicle_history(self, vehicle_id: str, since_ts: int,
+                        until_ts: Optional[int] = None) -> List[Dict[str, Any]]:
+        # (vehicle_id, ts) is the primary key, so both the equality and the
+        # range are served by one index scan - no sort, no extra index.
         c = db.get_connection()
+        clauses = ["vehicle_id=?", "ts >= ?"]
+        params: List[Any] = [vehicle_id, since_ts]
+        if until_ts is not None:
+            clauses.append("ts <= ?")
+            params.append(until_ts)
         return _rows(c.execute(
             "SELECT " + _VEHICLE_COLS + " FROM rt_vehicle_position "
-            "WHERE vehicle_id=? AND ts >= ? ORDER BY ts", (vehicle_id, since_ts)))
+            "WHERE " + " AND ".join(clauses) + " ORDER BY ts", params))
 
     def log_poll(self, **kw: Any) -> None:
         c = db.get_connection()
@@ -348,6 +434,87 @@ class SqliteRepository(Repository):
             "GROUP BY gy, gx ORDER BY observations DESC",
             (GRID_LAT_DEG, GRID_LON_DEG, MOVING_MPS, IMPLAUSIBLE_MPS,
              MOVING_MPS, IMPLAUSIBLE_MPS, MOVING_MPS, route_id, since_ts)))
+
+    # ---- analytics tier (the rollup write path) ---------------------------
+    def meta_get(self, key: str) -> Optional[str]:
+        row = db.get_connection().execute(
+            "SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def meta_set(self, key: str, value: str) -> None:
+        c = db.get_connection()
+        c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+        c.commit()
+
+    def newest_observation_ts(self) -> Optional[int]:
+        row = db.get_connection().execute(
+            "SELECT MAX(ts) AS mx FROM rt_vehicle_position").fetchone()
+        return int(row["mx"]) if row and row["mx"] is not None else None
+
+    def count_observations_since(self, since_ts: int) -> int:
+        return db.get_connection().execute(
+            "SELECT COUNT(*) AS n FROM rt_vehicle_position WHERE ts >= ?",
+            (since_ts,)).fetchone()["n"]
+
+    def fold_rollups(self, since_ts: int, lat_deg: float, lon_deg: float,
+                     hour_s: int, moving_mps: float, cap_mps: float) -> None:
+        c = db.get_connection()
+        params = {"since": since_ts, "lat_deg": lat_deg, "lon_deg": lon_deg,
+                  "hour": hour_s, "moving": moving_mps, "cap": cap_mps}
+
+        # ts is unix seconds and therefore never negative, so since_ts=0 makes
+        # these a full wipe - which is exactly what a full rebuild wants.
+        c.execute("DELETE FROM analytics_grid_hour WHERE hour_bucket >= ?", (since_ts,))
+        c.execute("DELETE FROM analytics_route_hour WHERE hour_bucket >= ?", (since_ts,))
+
+        c.execute("""
+            INSERT INTO analytics_grid_hour (
+                cell_y, cell_x, hour_bucket, observations, vehicles,
+                moving, stopped, speed_sum, speed_n, speed_min, speed_max)
+            SELECT
+                CAST(FLOOR(lat / :lat_deg) AS INTEGER),
+                CAST(FLOOR(lon / :lon_deg) AS INTEGER),
+                (ts / :hour) * :hour,
+                COUNT(*),
+                COUNT(DISTINCT vehicle_id),
+                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN 1 ELSE 0 END),
+                SUM(CASE WHEN speed <= :moving THEN 1 ELSE 0 END),
+                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN speed ELSE 0 END),
+                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN 1 ELSE 0 END),
+                MIN(CASE WHEN speed >  :moving AND speed < :cap THEN speed END),
+                MAX(CASE WHEN speed >  :moving AND speed < :cap THEN speed END)
+            FROM rt_vehicle_position
+            WHERE ts >= :since AND lat IS NOT NULL AND lon IS NOT NULL
+            GROUP BY 1, 2, 3
+        """, params)
+
+        c.execute("""
+            INSERT INTO analytics_route_hour (
+                route_id, hour_bucket, observations, vehicles,
+                moving, stopped, speed_sum, speed_n)
+            SELECT
+                route_id,
+                (ts / :hour) * :hour,
+                COUNT(*),
+                COUNT(DISTINCT vehicle_id),
+                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN 1 ELSE 0 END),
+                SUM(CASE WHEN speed <= :moving THEN 1 ELSE 0 END),
+                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN speed ELSE 0 END),
+                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN 1 ELSE 0 END)
+            FROM rt_vehicle_position
+            WHERE ts >= :since AND route_id IS NOT NULL
+            GROUP BY 1, 2
+        """, params)
+        c.commit()
+
+    def rollup_counts(self) -> Dict[str, int]:
+        c = db.get_connection()
+        return {
+            "cells": c.execute(
+                "SELECT COUNT(*) AS n FROM analytics_grid_hour").fetchone()["n"],
+            "routes": c.execute(
+                "SELECT COUNT(*) AS n FROM analytics_route_hour").fetchone()["n"],
+        }
 
     def hourly_series(self, since_ts: int) -> List[Dict[str, Any]]:
         c = db.get_connection()

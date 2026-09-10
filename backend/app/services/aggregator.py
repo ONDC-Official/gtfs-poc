@@ -22,7 +22,7 @@ import time
 from typing import Any, Dict, Optional
 
 from ..config import settings
-from ..data import db
+from ..data.repository import Repository
 
 log = logging.getLogger("gtfs.aggregator")
 
@@ -45,7 +45,8 @@ REWIND_S = HOUR
 
 
 class Aggregator:
-    def __init__(self, interval_s: int = 120):
+    def __init__(self, repo: Repository, interval_s: int = 120):
+        self.repo = repo
         self.interval_s = interval_s
         self._task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
@@ -84,103 +85,47 @@ class Aggregator:
     # ---- the rollup -------------------------------------------------------
     def run_once(self, full: bool = False) -> Dict[str, Any]:
         started = time.perf_counter()
-        conn = db.get_connection()
 
         if full:
             since = 0
-            conn.execute("DELETE FROM analytics_grid_hour")
-            conn.execute("DELETE FROM analytics_route_hour")
         else:
-            row = conn.execute("SELECT value FROM meta WHERE key=?",
-                               (WATERMARK_KEY,)).fetchone()
-            since = max(0, int(row["value"]) - REWIND_S) if row else 0
+            mark = self.repo.meta_get(WATERMARK_KEY)
+            since = max(0, int(mark) - REWIND_S) if mark else 0
 
         # Only fold buckets that have data, and align to the hour so a partial
         # bucket is replaced wholesale rather than double-counted.
         since = (since // HOUR) * HOUR
-        newest = conn.execute(
-            "SELECT MAX(ts) AS mx FROM rt_vehicle_position").fetchone()["mx"]
+        newest = self.repo.newest_observation_ts()
         if not newest:
             return {"rows_scanned": 0, "cells": 0, "routes": 0, "elapsed_ms": 0,
                     "watermark": since}
 
-        scanned = conn.execute(
-            "SELECT COUNT(*) AS n FROM rt_vehicle_position WHERE ts >= ?",
-            (since,)).fetchone()["n"]
+        scanned = self.repo.count_observations_since(since)
 
-        # Recomputing whole buckets is what makes re-runs idempotent.
-        conn.execute("DELETE FROM analytics_grid_hour WHERE hour_bucket >= ?", (since,))
-        conn.execute("DELETE FROM analytics_route_hour WHERE hour_bucket >= ?", (since,))
+        # Recomputing whole buckets is what makes re-runs idempotent. since=0
+        # (a full rebuild) folds the entire log, because ts is never negative.
+        self.repo.fold_rollups(since, GRID_LAT_DEG, GRID_LON_DEG,
+                               HOUR, MOVING_MPS, IMPLAUSIBLE_MPS)
 
-        params = {
-            "since": since, "lat_deg": GRID_LAT_DEG, "lon_deg": GRID_LON_DEG,
-            "hour": HOUR, "moving": MOVING_MPS, "cap": IMPLAUSIBLE_MPS,
-        }
+        # Advanced only after the fold commits: if this write is lost, the next
+        # pass rewinds from the older mark and re-folds, which is harmless.
+        self.repo.meta_set(WATERMARK_KEY, str(int(newest)))
 
-        conn.execute("""
-            INSERT INTO analytics_grid_hour (
-                cell_y, cell_x, hour_bucket, observations, vehicles,
-                moving, stopped, speed_sum, speed_n, speed_min, speed_max)
-            SELECT
-                CAST(FLOOR(lat / :lat_deg) AS INTEGER),
-                CAST(FLOOR(lon / :lon_deg) AS INTEGER),
-                (ts / :hour) * :hour,
-                COUNT(*),
-                COUNT(DISTINCT vehicle_id),
-                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN 1 ELSE 0 END),
-                SUM(CASE WHEN speed <= :moving THEN 1 ELSE 0 END),
-                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN speed ELSE 0 END),
-                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN 1 ELSE 0 END),
-                MIN(CASE WHEN speed >  :moving AND speed < :cap THEN speed END),
-                MAX(CASE WHEN speed >  :moving AND speed < :cap THEN speed END)
-            FROM rt_vehicle_position
-            WHERE ts >= :since AND lat IS NOT NULL AND lon IS NOT NULL
-            GROUP BY 1, 2, 3
-        """, params)
-
-        conn.execute("""
-            INSERT INTO analytics_route_hour (
-                route_id, hour_bucket, observations, vehicles,
-                moving, stopped, speed_sum, speed_n)
-            SELECT
-                route_id,
-                (ts / :hour) * :hour,
-                COUNT(*),
-                COUNT(DISTINCT vehicle_id),
-                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN 1 ELSE 0 END),
-                SUM(CASE WHEN speed <= :moving THEN 1 ELSE 0 END),
-                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN speed ELSE 0 END),
-                SUM(CASE WHEN speed >  :moving AND speed < :cap THEN 1 ELSE 0 END)
-            FROM rt_vehicle_position
-            WHERE ts >= :since AND route_id IS NOT NULL
-            GROUP BY 1, 2
-        """, params)
-
-        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-                     (WATERMARK_KEY, str(int(newest))))
-        conn.commit()
-
-        cells = conn.execute("SELECT COUNT(*) AS n FROM analytics_grid_hour").fetchone()["n"]
-        routes = conn.execute("SELECT COUNT(*) AS n FROM analytics_route_hour").fetchone()["n"]
+        counts = self.repo.rollup_counts()
         return {
             "rows_scanned": scanned,
-            "cells": cells,
-            "routes": routes,
+            "cells": counts["cells"],
+            "routes": counts["routes"],
             "watermark": int(newest),
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
         }
 
     def status(self) -> Dict[str, Any]:
-        conn = db.get_connection()
-        row = conn.execute("SELECT value FROM meta WHERE key=?",
-                           (WATERMARK_KEY,)).fetchone()
+        mark = self.repo.meta_get(WATERMARK_KEY)
         return {
             "grid_m": int(GRID_M),
             "interval_s": self.interval_s,
-            "watermark_ts": int(row["value"]) if row else None,
+            "watermark_ts": int(mark) if mark else None,
             "last_run": self.last_run,
             "retention_hours": settings.history_retention_hours,
         }
-
-
-aggregator = Aggregator()

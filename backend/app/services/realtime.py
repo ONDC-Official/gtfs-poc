@@ -22,6 +22,9 @@ log = logging.getLogger("gtfs.realtime")
 
 _TAG = re.compile(r"<[^>]+>")
 
+# The per-point projection of a vehicle trail. See RealtimeService.history().
+TRAIL_FIELDS = ("ts", "lat", "lon", "speed", "bearing", "route_id", "trip_id")
+
 
 def _tidy_error(status_code, body):
     """Gateways answer with HTML error pages; the UI shows this string in a
@@ -282,6 +285,30 @@ class RealtimeService:
         return rows
 
     # ---- reads ------------------------------------------------------------
+    def history(self, vehicle_id: str, from_ts: int, to_ts: int) -> Dict[str, Any]:
+        """One vehicle's trail over a closed time window.
+
+        Projected to the fields that describe motion. The rest of the stored
+        row is either constant for the query (vehicle_id), an ingestion detail
+        (ingested_at), or one of the four fields this feed never populates -
+        all of which would be dead weight repeated on every point.
+        """
+        rows = self.repo.vehicle_history(vehicle_id, from_ts, to_ts)
+        return {
+            "vehicle_id": vehicle_id,
+            "from": from_ts,
+            "to": to_ts,
+            "count": len(rows),
+            "items": [{k: r.get(k) for k in TRAIL_FIELDS} for r in rows],
+            "geometry": {
+                "type": "LineString",
+                # Both halves must be present: a row with one coordinate null
+                # would otherwise emit a malformed position.
+                "coordinates": [[r["lon"], r["lat"]] for r in rows
+                                if r.get("lon") is not None and r.get("lat") is not None],
+            },
+        }
+
     def decorate(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Join route names onto realtime rows for display."""
         names = self.repo.route_names([r.get("route_id") for r in rows])

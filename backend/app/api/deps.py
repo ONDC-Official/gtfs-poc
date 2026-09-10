@@ -8,7 +8,7 @@ from typing import Optional
 from ..data.repository import Repository
 from ..data.sqlite_repo import repository as _repository
 from ..services.analytics import AnalyticsService
-from ..services.aggregator import aggregator as _aggregator
+from ..services.aggregator import Aggregator
 from ..services.live_analytics import LiveAnalytics
 from ..services.realtime import RealtimeService
 from ..services.spatial_analytics import SpatialAnalytics
@@ -17,7 +17,7 @@ repository: Repository = _repository
 analytics = AnalyticsService(repository)
 live_analytics = LiveAnalytics(repository)
 spatial = SpatialAnalytics(repository)
-aggregator = _aggregator
+aggregator = Aggregator(repository)
 realtime: Optional[RealtimeService] = None
 
 

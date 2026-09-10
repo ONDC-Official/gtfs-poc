@@ -36,6 +36,13 @@ class Repository(abc.ABC):
                       limit: int) -> List[Dict[str, Any]]: ...
 
     @abc.abstractmethod
+    def routes_nearby(self, lat: float, lon: float, radius_m: float,
+                      limit: int) -> List[Dict[str, Any]]:
+        """Routes serving any stop within `radius_m` of the point, nearest
+        first. Each entry carries the names of the stops that put it in range
+        and the distance to the closest of them."""
+
+    @abc.abstractmethod
     def route_names(self, route_ids: Sequence[str]) -> Dict[str, Dict[str, Any]]:
         """Bulk route lookup used to decorate realtime vehicles."""
 
@@ -50,7 +57,10 @@ class Repository(abc.ABC):
                         max_age_s: Optional[int]) -> List[Dict[str, Any]]: ...
 
     @abc.abstractmethod
-    def vehicle_history(self, vehicle_id: str, since_ts: int) -> List[Dict[str, Any]]: ...
+    def vehicle_history(self, vehicle_id: str, since_ts: int,
+                        until_ts: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Observations for one vehicle, oldest first. `until_ts` bounds the
+        window at the top; None means "up to the newest row"."""
 
     @abc.abstractmethod
     def log_poll(self, **kwargs: Any) -> None: ...
@@ -110,3 +120,37 @@ class Repository(abc.ABC):
 
     @abc.abstractmethod
     def hourly_series(self, since_ts: int) -> List[Dict[str, Any]]: ...
+
+    # ---- analytics tier (the rollup write path) ---------------------------
+    # The aggregator owns the *policy* - watermark, rewind, hour alignment.
+    # These are the storage primitives it drives, so that no service holds a
+    # SQL dialect.
+    @abc.abstractmethod
+    def meta_get(self, key: str) -> Optional[str]:
+        """Read a meta value, or None when the key was never written."""
+
+    @abc.abstractmethod
+    def meta_set(self, key: str, value: str) -> None:
+        """Upsert a meta value."""
+
+    @abc.abstractmethod
+    def newest_observation_ts(self) -> Optional[int]:
+        """MAX(ts) over the observation log; None when the log is empty."""
+
+    @abc.abstractmethod
+    def count_observations_since(self, since_ts: int) -> int: ...
+
+    @abc.abstractmethod
+    def fold_rollups(self, since_ts: int, lat_deg: float, lon_deg: float,
+                     hour_s: int, moving_mps: float, cap_mps: float) -> None:
+        """Recompute every rollup bucket at or after `since_ts` from the log.
+
+        Replaces whole buckets rather than accumulating deltas - that is what
+        makes a re-run over an already-folded window idempotent. Must be one
+        transaction: a half-applied fold would leave the rollups short until
+        the next pass.
+        """
+
+    @abc.abstractmethod
+    def rollup_counts(self) -> Dict[str, int]:
+        """Row counts of the rollup tables, as {"cells": n, "routes": n}."""

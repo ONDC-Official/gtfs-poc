@@ -2,7 +2,7 @@
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from . import deps
 
@@ -30,13 +30,34 @@ def vehicles(route_id: Optional[str] = None,
 
 
 @router.get("/vehicles/{vehicle_id}/history")
-def vehicle_history(vehicle_id: str, minutes: int = Query(60, ge=1, le=1440)):
-    since = int(time.time()) - minutes * 60
-    rows = deps.repository.vehicle_history(vehicle_id, since)
-    return {"vehicle_id": vehicle_id, "count": len(rows), "items": rows,
-            "geometry": {"type": "LineString",
-                         "coordinates": [[r["lon"], r["lat"]] for r in rows
-                                         if r.get("lon") is not None]}}
+def vehicle_history(
+    vehicle_id: str,
+    from_ts: Optional[int] = Query(
+        None, alias="from", ge=0,
+        description="Window start, unix seconds, inclusive."),
+    to_ts: Optional[int] = Query(
+        None, alias="to", ge=0,
+        description="Window end, unix seconds, inclusive."),
+    minutes: int = Query(60, ge=1, le=1440,
+                         description="Trailing window. Ignored when from/to are given."),
+):
+    """One vehicle's trail. `from`/`to` take precedence over `minutes`.
+
+    Only what the retention window still holds is returned, so a `from` older
+    than HISTORY_RETENTION_HOURS yields whatever survived pruning.
+    """
+    if (from_ts is None) != (to_ts is None):
+        raise HTTPException(422, "from and to must be supplied together")
+    if from_ts is None:
+        to_ts = int(time.time())
+        from_ts = to_ts - minutes * 60
+    elif from_ts > to_ts:
+        raise HTTPException(422, "from must not be later than to")
+
+    result = deps.get_realtime().history(vehicle_id, from_ts, to_ts)
+    if not result["count"]:
+        raise HTTPException(404, "no observations for this vehicle in the window")
+    return result
 
 
 @router.post("/poll")
