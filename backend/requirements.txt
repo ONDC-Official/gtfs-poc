@@ -6,3 +6,5 @@ httpx==0.28.1
 gtfs-realtime-bindings==1.0.0
 protobuf==4.25.5
 python-dotenv==1.0.1
+psycopg[binary]==3.3.5
+psycopg-pool==3.3.1

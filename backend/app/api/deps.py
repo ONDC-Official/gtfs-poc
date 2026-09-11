@@ -5,15 +5,25 @@ construct services themselves.
 """
 from typing import Optional
 
+from ..config import settings
 from ..data.repository import Repository
-from ..data.sqlite_repo import repository as _repository
 from ..services.analytics import AnalyticsService
 from ..services.aggregator import Aggregator
 from ..services.live_analytics import LiveAnalytics
 from ..services.realtime import RealtimeService
 from ..services.spatial_analytics import SpatialAnalytics
 
-repository: Repository = _repository
+def _load_repository() -> Repository:
+    """Pick the data-plane adapter from DB_BACKEND. The postgres import is
+    deferred so a SQLite-only install never needs psycopg."""
+    if settings.db_backend == "postgres":
+        from ..data.postgres_repo import repository as repo
+    else:
+        from ..data.sqlite_repo import repository as repo
+    return repo
+
+
+repository: Repository = _load_repository()
 analytics = AnalyticsService(repository)
 live_analytics = LiveAnalytics(repository)
 spatial = SpatialAnalytics(repository)

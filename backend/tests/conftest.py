@@ -23,6 +23,12 @@ os.environ["DB_PATH"] = str(_TMP / "contract.db")
 os.environ["RT_API_KEY"] = ""
 os.environ["RT_MOCK_WHEN_UNCONFIGURED"] = "false"
 
+# Where the Postgres adapter's pool connects, if the suite reaches that far.
+# Set before the settings singleton is built; harmless when only SQLite runs.
+_PG_DSN = os.environ.get(
+    "GTFS_TEST_PG_DSN", "postgresql://postgres:test@localhost:55432/gtfs")
+os.environ["DATABASE_URL"] = _PG_DSN
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.data import db                                    # noqa: E402
@@ -132,8 +138,12 @@ def _insert(conn, table, cols, rows, ph):
     if not rows:
         return
     marks = "(" + ",".join([ph] * len(cols)) + ")"
-    conn.executemany(
-        "INSERT INTO {0} ({1}) VALUES {2}".format(table, ",".join(cols), marks), rows)
+    sql = "INSERT INTO {0} ({1}) VALUES {2}".format(table, ",".join(cols), marks)
+    if hasattr(conn, "executemany"):        # sqlite3.Connection
+        conn.executemany(sql, rows)
+    else:                                   # psycopg.Connection - cursor only
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
 
 
 def _seed_sqlite():
@@ -162,9 +172,56 @@ def _seed_sqlite():
     conn.commit()
 
 
-# Phase 3 appends ("postgres", PostgresRepository, _seed_postgres) here and the
-# entire suite below runs against it unchanged.
 ADAPTERS = [("sqlite", SqliteRepository, _seed_sqlite)]
+
+# ---------------------------------------------------------------------------
+# Postgres adapter - added to ADAPTERS only when a PostGIS database is
+# reachable, so `pytest` still runs anywhere. Point it with GTFS_TEST_PG_DSN
+# (read at the top of this file); the default matches the throwaway container
+# used during development:
+#     docker run -d --name gtfs-pg -e POSTGRES_PASSWORD=test \
+#         -e POSTGRES_DB=gtfs -p 55432:5432 postgis/postgis:16-3.4
+try:
+    import psycopg
+    with psycopg.connect(_PG_DSN, connect_timeout=3) as _probe:
+        _probe.execute("SELECT 1")
+    _PG_OK = True
+except Exception:
+    _PG_OK = False
+
+if _PG_OK:
+    from app.data import pg                               # noqa: E402
+    from app.data.postgres_repo import PostgresRepository  # noqa: E402
+
+    pg.init_db()   # once - the script is IF-NOT-EXISTS throughout
+
+    _PG_TABLES = ("gtfs_agency", "gtfs_routes", "gtfs_stops", "gtfs_trips",
+                  "gtfs_stop_times", "gtfs_shapes", "rt_vehicle_position",
+                  "rt_vehicle_latest", "rt_poll_log", "meta",
+                  "analytics_grid_hour", "analytics_route_hour")
+
+    def _seed_postgres():
+        with pg.pool().connection() as conn:
+            conn.execute("TRUNCATE " + ", ".join(_PG_TABLES) + " RESTART IDENTITY")
+            for table, (cols, rows) in DATASET.items():
+                _insert(conn, table, cols, rows, "%s")
+            obs = [r + (NOW,) for r in OBSERVATIONS]
+            # Carve the daily partitions before the bulk insert, the same way
+            # upsert_vehicles() does at runtime - otherwise these rows land in
+            # the default partition and later ensure-partition calls collide.
+            for day_ts in {(r[1] // 86400) * 86400 for r in obs}:
+                conn.execute("SELECT rt_ensure_day_partition(%s)", (day_ts,))
+            _insert(conn, "rt_vehicle_position", _VEHICLE_COLS, obs, "%s")
+            latest = {}
+            for r in obs:
+                if r[0] not in latest or r[1] > latest[r[0]][1]:
+                    latest[r[0]] = r
+            _insert(conn, "rt_vehicle_latest", _VEHICLE_COLS, list(latest.values()), "%s")
+            _insert(conn, "rt_poll_log", _POLL_COLS, POLLS, "%s")
+            conn.execute("INSERT INTO meta (key, value) VALUES ('static_loaded_at', %s)",
+                         (str(NOW - 86400),))
+
+    ADAPTERS.append(("postgres", PostgresRepository, _seed_postgres))
 
 
 @pytest.fixture(scope="session", autouse=True)

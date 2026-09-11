@@ -18,3 +18,4 @@ __pycache__/
 node_modules/
 frontend/dist/
 .DS_Store
+delhi_buses_static_gtfs_v1.zip

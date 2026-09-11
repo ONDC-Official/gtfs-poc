@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     db_path: Path = REPO_ROOT / "data" / "gtfs.db"
     gtfs_static_dir: Path = REPO_ROOT / "delhi_buses_static_gtfs_v1-2"
 
+    # Which Repository implementation the data plane uses. "sqlite" is the
+    # default for local dev and the offline demo; "postgres" selects the
+    # PostgreSQL + PostGIS adapter, which needs DATABASE_URL.
+    db_backend: str = "sqlite"
+    database_url: str = "postgresql://gtfs:gtfs@localhost:5432/gtfs"
+    pg_pool_max: int = 10
+
     # ---- GTFS-realtime feed ----------------------------------------------
     # Delhi Open Transit Data. Override either piece in backend/.env
     rt_vehicle_positions_url: str = "https://otd.delhi.gov.in/api/realtime/VehiclePositions.pb"

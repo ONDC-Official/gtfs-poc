@@ -28,11 +28,14 @@ async def lifespan(app: FastAPI):
     db.init_db()
     deps.realtime = RealtimeService(deps.repository)
     await deps.realtime.start()
-    # Analytics tier. Runs in-process because SQLite serialises writers and
-    # the poller is already one; run_once() is the seam for extracting it.
+    # Analytics tier. Runs in-process because a single SQLite writer cannot be
+    # shared across processes; on Postgres run_once() is the seam for lifting
+    # it into its own service.
     await deps.aggregator.start()
-    log.info("service ready | db=%s | poll=%ss | source=%s",
-             settings.db_path.name, settings.rt_poll_seconds,
+    store = ("postgres" if settings.db_backend == "postgres"
+             else settings.db_path.name)
+    log.info("service ready | store=%s | poll=%ss | source=%s",
+             store, settings.rt_poll_seconds,
              "live feed" if settings.rt_configured else "simulated")
     try:
         yield

@@ -43,6 +43,13 @@ def get_connection() -> sqlite3.Connection:
 
 
 def init_db(path: Optional[Path] = None) -> None:
+    # main.py calls this unconditionally at startup; dispatch on the backend so
+    # a Postgres deployment applies schema_postgres.sql instead. `path` only
+    # ever means something for SQLite.
+    if settings.db_backend == "postgres":
+        from . import pg
+        pg.init_db()
+        return
     conn = connect(path)
     try:
         conn.executescript(_SCHEMA.read_text())
