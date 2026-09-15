@@ -151,8 +151,11 @@ class QualityService:
         trips = self.repo.trip_completeness(since_ts, now)
 
         interval_s = max(settings.rt_poll_seconds, 1)
-        avg_span = report.get("avg_span_s") or 0
-        avg_obs = report.get("avg_observations_per_vehicle") or 0
+        # Postgres' AVG() over bigint columns returns Decimal (via psycopg),
+        # not float like SQLite always does - coerce explicitly so the
+        # mixed-type arithmetic below doesn't blow up on one backend only.
+        avg_span = float(report.get("avg_span_s") or 0)
+        avg_obs = float(report.get("avg_observations_per_vehicle") or 0)
         expected_slots = (avg_span / interval_s) + 1 if avg_span else None
         continuity_ratio = (
             round(min(100.0, avg_obs / expected_slots * 100), 1)
