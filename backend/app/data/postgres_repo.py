@@ -547,60 +547,111 @@ class PostgresRepository(Repository):
             "(SELECT DISTINCT cell_y, cell_x FROM analytics_grid_hour "
             "WHERE hour_bucket >= %s) t", (since_ts,))["n"]
 
-    def continuity_report(self, since_ts: int, until_ts: int,
-                          gap_threshold_s: int) -> Dict[str, Any]:
-        with pg.pool().connection() as conn:
-            totals = conn.execute(
-                "WITH ordered AS ("
-                "  SELECT vehicle_id, "
-                "         ts - LAG(ts) OVER (PARTITION BY vehicle_id ORDER BY ts) AS gap "
-                "  FROM rt_vehicle_position WHERE ts BETWEEN %(since)s AND %(until)s"
-                "), per_vehicle AS ("
-                "  SELECT vehicle_id, COUNT(*) AS observations, "
-                "         MIN(ts) AS first_ts, MAX(ts) AS last_ts "
-                "  FROM rt_vehicle_position WHERE ts BETWEEN %(since)s AND %(until)s "
-                "  GROUP BY vehicle_id"
-                ") "
-                "SELECT (SELECT COUNT(*) FROM per_vehicle) AS vehicles, "
-                "(SELECT COALESCE(SUM(observations), 0) FROM per_vehicle) AS observations, "
-                "(SELECT COUNT(*) FROM ordered WHERE gap IS NOT NULL) AS gaps_total, "
-                "(SELECT COUNT(*) FROM ordered WHERE gap > %(thr)s) AS gaps_over_threshold, "
-                "(SELECT AVG(last_ts - first_ts) FROM per_vehicle) AS avg_span_s, "
-                "(SELECT AVG(observations::float) FROM per_vehicle) AS avg_observations_per_vehicle",
-                {"since": since_ts, "until": until_ts, "thr": gap_threshold_s}).fetchone()
-            buckets = conn.execute(
-                "WITH ordered AS ("
-                "  SELECT ts - LAG(ts) OVER (PARTITION BY vehicle_id ORDER BY ts) AS gap "
-                "  FROM rt_vehicle_position WHERE ts BETWEEN %(since)s AND %(until)s"
-                ") "
-                "SELECT "
-                "SUM(CASE WHEN gap > 0 AND gap <= 60 THEN 1 ELSE 0 END) AS b_0_60, "
-                "SUM(CASE WHEN gap > 60 AND gap <= 180 THEN 1 ELSE 0 END) AS b_60_180, "
-                "SUM(CASE WHEN gap > 180 AND gap <= 300 THEN 1 ELSE 0 END) AS b_180_300, "
-                "SUM(CASE WHEN gap > 300 AND gap <= 600 THEN 1 ELSE 0 END) AS b_300_600, "
-                "SUM(CASE WHEN gap > 600 THEN 1 ELSE 0 END) AS b_600_plus "
-                "FROM ordered WHERE gap IS NOT NULL",
-                {"since": since_ts, "until": until_ts}).fetchone()
-        out = dict(totals)
-        out["gap_buckets"] = dict(buckets)
+    def continuity_report(self, since_ts: int, until_ts: int) -> Dict[str, Any]:
+        # Not a window function - a plain GROUP BY, so left as a live query
+        # (see Repository.continuity_report's docstring for why the gap
+        # counters below are not: a LAG() over the full window here is what
+        # caused the 504s this replaced, on the day-partitioned table).
+        per_vehicle = self._one(
+            "SELECT COUNT(*) AS vehicles, COALESCE(SUM(observations), 0) AS observations, "
+            "AVG(last_ts - first_ts) AS avg_span_s, "
+            "AVG(observations::float) AS avg_observations_per_vehicle FROM ("
+            "  SELECT COUNT(*) AS observations, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
+            "  FROM rt_vehicle_position WHERE ts BETWEEN %(since)s AND %(until)s "
+            "  GROUP BY vehicle_id"
+            ") t", {"since": since_ts, "until": until_ts})
+        gaps = dict(self._one(
+            "SELECT COALESCE(SUM(gaps_total), 0) AS gaps_total, "
+            "COALESCE(SUM(gaps_over_threshold), 0) AS gaps_over_threshold, "
+            "COALESCE(SUM(b_0_60), 0) AS b_0_60, COALESCE(SUM(b_60_180), 0) AS b_60_180, "
+            "COALESCE(SUM(b_180_300), 0) AS b_180_300, COALESCE(SUM(b_300_600), 0) AS b_300_600, "
+            "COALESCE(SUM(b_600_plus), 0) AS b_600_plus "
+            "FROM analytics_continuity_hour WHERE hour_bucket BETWEEN %(since)s AND %(until)s",
+            {"since": since_ts, "until": until_ts}))
+        out = dict(per_vehicle)
+        out["gaps_total"] = gaps.pop("gaps_total")
+        out["gaps_over_threshold"] = gaps.pop("gaps_over_threshold")
+        out["gap_buckets"] = gaps
         return out
 
-    def trip_completeness(self, since_ts: int, until_ts: int,
-                          gap_threshold_s: int) -> Dict[str, Any]:
+    def trip_completeness(self, since_ts: int, until_ts: int) -> Dict[str, Any]:
         return self._one(
-            "WITH ordered AS ("
-            "  SELECT vehicle_id, trip_id, "
-            "         ts - LAG(ts) OVER (PARTITION BY vehicle_id, trip_id ORDER BY ts) AS gap "
-            "  FROM rt_vehicle_position "
-            "  WHERE ts BETWEEN %(since)s AND %(until)s AND trip_id IS NOT NULL"
-            "), per_trip AS ("
-            "  SELECT vehicle_id, trip_id, "
-            "         MAX(CASE WHEN gap > %(thr)s THEN 1 ELSE 0 END) AS has_gap "
-            "  FROM ordered GROUP BY vehicle_id, trip_id"
-            ") "
-            "SELECT COUNT(*) AS trips, COALESCE(SUM(1 - has_gap), 0) AS complete_trips "
-            "FROM per_trip",
-            {"since": since_ts, "until": until_ts, "thr": gap_threshold_s})
+            "SELECT COUNT(*) AS trips, "
+            "COALESCE(SUM(CASE WHEN NOT has_gap THEN 1 ELSE 0 END), 0) AS complete_trips "
+            "FROM analytics_trip_gap_state WHERE last_ts BETWEEN %(since)s AND %(until)s",
+            {"since": since_ts, "until": until_ts})
+
+    def fold_continuity_gaps(self, since_ts: int, until_ts: int,
+                             gap_threshold_s: int) -> None:
+        # One statement: every CTE below (writable ones included) commits
+        # atomically as a single implicit transaction. The three writable
+        # CTEs are referenced from the final INSERT's WHERE clause (always
+        # true - COUNT(*) >= 0) purely so Postgres actually executes them; an
+        # otherwise-unreferenced writable CTE is not guaranteed to run.
+        with pg.pool().connection() as conn:
+            conn.execute(
+                "WITH batch AS ("
+                "  SELECT vehicle_id, trip_id, ts FROM rt_vehicle_position "
+                "  WHERE ts > %(since)s AND ts <= %(until)s"
+                "), batch_gap AS ("
+                "  SELECT b.vehicle_id, b.trip_id, b.ts, "
+                "    COALESCE(LAG(b.ts) OVER (PARTITION BY b.vehicle_id ORDER BY b.ts), "
+                "             vgs.last_ts) AS prev_ts, "
+                "    COALESCE(LAG(b.ts) OVER (PARTITION BY b.vehicle_id, b.trip_id "
+                "                             ORDER BY b.ts), tgs.last_ts) AS prev_trip_ts "
+                "  FROM batch b "
+                "  LEFT JOIN analytics_vehicle_gap_state vgs ON vgs.vehicle_id = b.vehicle_id "
+                "  LEFT JOIN analytics_trip_gap_state tgs "
+                "    ON tgs.vehicle_id = b.vehicle_id AND tgs.trip_id = b.trip_id"
+                "), ins_hourly AS ("
+                "  INSERT INTO analytics_continuity_hour "
+                "    (hour_bucket, gaps_total, gaps_over_threshold, "
+                "     b_0_60, b_60_180, b_180_300, b_300_600, b_600_plus) "
+                "  SELECT (ts / 3600) * 3600, COUNT(*), "
+                "    SUM(CASE WHEN (ts - prev_ts) > %(thr)s THEN 1 ELSE 0 END), "
+                "    SUM(CASE WHEN (ts - prev_ts) > 0 AND (ts - prev_ts) <= 60 "
+                "         THEN 1 ELSE 0 END), "
+                "    SUM(CASE WHEN (ts - prev_ts) > 60 AND (ts - prev_ts) <= 180 "
+                "         THEN 1 ELSE 0 END), "
+                "    SUM(CASE WHEN (ts - prev_ts) > 180 AND (ts - prev_ts) <= 300 "
+                "         THEN 1 ELSE 0 END), "
+                "    SUM(CASE WHEN (ts - prev_ts) > 300 AND (ts - prev_ts) <= 600 "
+                "         THEN 1 ELSE 0 END), "
+                "    SUM(CASE WHEN (ts - prev_ts) > 600 THEN 1 ELSE 0 END) "
+                "  FROM batch_gap WHERE prev_ts IS NOT NULL GROUP BY 1 "
+                "  ON CONFLICT (hour_bucket) DO UPDATE SET "
+                "    gaps_total = analytics_continuity_hour.gaps_total + excluded.gaps_total, "
+                "    gaps_over_threshold = analytics_continuity_hour.gaps_over_threshold "
+                "                          + excluded.gaps_over_threshold, "
+                "    b_0_60 = analytics_continuity_hour.b_0_60 + excluded.b_0_60, "
+                "    b_60_180 = analytics_continuity_hour.b_60_180 + excluded.b_60_180, "
+                "    b_180_300 = analytics_continuity_hour.b_180_300 + excluded.b_180_300, "
+                "    b_300_600 = analytics_continuity_hour.b_300_600 + excluded.b_300_600, "
+                "    b_600_plus = analytics_continuity_hour.b_600_plus + excluded.b_600_plus "
+                "  RETURNING 1"
+                "), ins_vehicle AS ("
+                "  INSERT INTO analytics_vehicle_gap_state (vehicle_id, last_ts) "
+                "  SELECT vehicle_id, MAX(ts) FROM batch_gap GROUP BY vehicle_id "
+                "  ON CONFLICT (vehicle_id) DO UPDATE SET last_ts = excluded.last_ts "
+                "  RETURNING 1"
+                "), ins_trip AS ("
+                "  INSERT INTO analytics_trip_gap_state (vehicle_id, trip_id, last_ts, has_gap) "
+                "  SELECT vehicle_id, trip_id, MAX(ts), "
+                "    bool_or(prev_trip_ts IS NOT NULL AND (ts - prev_trip_ts) > %(thr)s) "
+                "  FROM batch_gap WHERE trip_id IS NOT NULL GROUP BY vehicle_id, trip_id "
+                "  ON CONFLICT (vehicle_id, trip_id) DO UPDATE SET "
+                "    last_ts = excluded.last_ts, "
+                "    has_gap = analytics_trip_gap_state.has_gap OR excluded.has_gap "
+                "  RETURNING 1"
+                ") "
+                "INSERT INTO meta (key, value) "
+                "SELECT 'continuity_watermark_ts', %(until_s)s "
+                "WHERE (SELECT COUNT(*) FROM ins_hourly) >= 0 "
+                "  AND (SELECT COUNT(*) FROM ins_vehicle) >= 0 "
+                "  AND (SELECT COUNT(*) FROM ins_trip) >= 0 "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                {"since": since_ts, "until": until_ts, "thr": gap_threshold_s,
+                 "until_s": str(until_ts)})
 
     def referential_integrity(self, since_ts: int) -> Dict[str, Any]:
         return self._one(

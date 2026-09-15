@@ -265,3 +265,44 @@ CREATE TABLE IF NOT EXISTS analytics_route_hour (
     PRIMARY KEY (route_id, hour_bucket)
 );
 CREATE INDEX IF NOT EXISTS ix_route_hour ON analytics_route_hour(hour_bucket);
+
+-- ---------------------------------------------------------------------------
+-- Continuity rollup (Layer 3). Deliberately NOT recomputed-whole-bucket like
+-- grid/route above: a gap is defined between two consecutive rows, so a
+-- bucket can't be derived in isolation without knowing the row before it.
+-- These state tables carry that forward; the fold only ever scans the new
+-- rows since the last pass (services/aggregator.py), never full history -
+-- which is what keeps a LAG() over this table cheap on a day-partitioned
+-- table: the batch is always small and almost always single-partition,
+-- unlike a live query re-deriving gaps from the whole retained window.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS analytics_vehicle_gap_state (
+    vehicle_id text PRIMARY KEY,
+    last_ts    bigint NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS analytics_trip_gap_state (
+    vehicle_id text    NOT NULL,
+    trip_id    text    NOT NULL,
+    last_ts    bigint  NOT NULL,
+    has_gap    boolean NOT NULL DEFAULT false,
+    PRIMARY KEY (vehicle_id, trip_id)
+);
+CREATE INDEX IF NOT EXISTS ix_trip_gap_last_ts ON analytics_trip_gap_state(last_ts);
+
+CREATE TABLE IF NOT EXISTS analytics_continuity_hour (
+    hour_bucket         bigint  NOT NULL,
+    gaps_total          integer NOT NULL DEFAULT 0,
+    gaps_over_threshold integer NOT NULL DEFAULT 0,
+    b_0_60              integer NOT NULL DEFAULT 0,
+    b_60_180            integer NOT NULL DEFAULT 0,
+    b_180_300           integer NOT NULL DEFAULT 0,
+    b_300_600           integer NOT NULL DEFAULT 0,
+    b_600_plus          integer NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour_bucket)
+);
+-- Watermark lives in meta, key 'continuity_watermark_ts' - separate from the
+-- grid/route watermark ('aggregate_watermark_ts') because this one must never
+-- rewind (see comment above): rewinding would double-count into the additive
+-- counters here.

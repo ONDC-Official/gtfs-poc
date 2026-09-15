@@ -5,7 +5,7 @@ import { InfoTip } from '../components/InfoTip'
 import { ago } from '../format'
 import type { QualitySummary } from '../types'
 
-const pct = (v: number | null | undefined) => (v == null ? '—' : `${v}%`)
+const pct = (v: number | null | undefined) => (v == null ? '—' : `${Math.round(v * 10) / 10}%`)
 const num = (v: number | null | undefined, unit = '') =>
   v == null ? '—' : `${v.toLocaleString()}${unit}`
 

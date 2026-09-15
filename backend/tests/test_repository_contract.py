@@ -503,36 +503,56 @@ def test_distinct_grid_cells_matches_base_resolution_grid(repo):
 
 
 def test_continuity_report_basic(repo):
-    # In-window: V1 (4 obs, hourly-ish), V2 (2 obs), SIM-1 (1 obs). V3's one
-    # observation is 40,000s old and falls outside this window.
-    r = repo.continuity_report(NOW - 4 * HOUR, NOW, 90)
-    assert r["vehicles"] == 3
-    assert r["observations"] == 7
-    # V1 contributes 3 successive gaps, V2 contributes 1; SIM-1 has only one
-    # row so no gap. Every one of those 4 gaps is hour-scale, so all clear a
-    # 90s threshold.
+    # Fold the whole fixture in one pass, then read the same range - vehicles:
+    # V1 (4 obs), V2 (2 obs), V3 (1 obs, no gap possible), SIM-1 (1 obs).
+    repo.fold_continuity_gaps(0, NOW, 90)
+    r = repo.continuity_report(0, NOW)
+    assert r["vehicles"] == 4
+    assert r["observations"] == 8
+    # V1 contributes 3 successive gaps, V2 contributes 1; V3 and SIM-1 each
+    # have only one row so no gap. Every one of those 4 gaps is hour-scale,
+    # so all clear the 90s threshold this was folded with.
     assert r["gaps_total"] == 4
     assert r["gaps_over_threshold"] == 4
     assert r["gap_buckets"]["b_600_plus"] == 4
     assert sum(r["gap_buckets"].values()) == 4
-    assert r["avg_span_s"] == pytest.approx((10740 + 7110 + 0) / 3)
-    assert r["avg_observations_per_vehicle"] == pytest.approx(7 / 3)
+    assert r["avg_span_s"] == pytest.approx((10740 + 7110 + 0 + 0) / 4)
+    assert r["avg_observations_per_vehicle"] == pytest.approx(8 / 4)
 
 
-def test_continuity_report_respects_threshold(repo):
-    r = repo.continuity_report(NOW - 4 * HOUR, NOW, 999_999)
-    assert r["gaps_total"] == 4          # unaffected by the threshold
+def test_continuity_report_threshold_is_baked_in_at_fold_time(repo):
+    repo.fold_continuity_gaps(0, NOW, 999_999)
+    r = repo.continuity_report(0, NOW)
+    assert r["gaps_total"] == 4           # unaffected by the threshold
     assert r["gaps_over_threshold"] == 0  # nothing clears this one
 
 
+def test_fold_continuity_gaps_two_chunks_accumulate_without_double_counting(repo):
+    """The property the whole incremental design rests on: folding the same
+    window in two adjacent pieces (as the aggregator's day-chunked catch-up
+    does) must land on the same totals as one fold over the whole range -
+    including V1's gap that straddles the chunk boundary, carried forward via
+    analytics_vehicle_gap_state rather than lost or double-counted."""
+    mid = NOW - 2 * HOUR
+    repo.fold_continuity_gaps(0, mid, 90)
+    repo.fold_continuity_gaps(mid, NOW, 90)
+    r = repo.continuity_report(0, NOW)
+    assert r["gaps_total"] == 4
+    assert r["gaps_over_threshold"] == 4
+    assert sum(r["gap_buckets"].values()) == 4
+
+
 def test_trip_completeness(repo):
-    since = NOW - 4 * HOUR
     # V3 and SIM-1 have no trip_id, so only (V1, T1) and (V2, T3) count.
-    strict = repo.trip_completeness(since, NOW, 90)
+    repo.fold_continuity_gaps(0, NOW, 90)
+    strict = repo.trip_completeness(0, NOW)
     assert strict["trips"] == 2
     assert strict["complete_trips"] == 0
 
-    lenient = repo.trip_completeness(since, NOW, 999_999)
+
+def test_trip_completeness_threshold_is_baked_in_at_fold_time(repo):
+    repo.fold_continuity_gaps(0, NOW, 999_999)
+    lenient = repo.trip_completeness(0, NOW)
     assert lenient["trips"] == 2
     assert lenient["complete_trips"] == 2
 

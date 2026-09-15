@@ -175,19 +175,41 @@ class Repository(abc.ABC):
         `since_ts`. Layer 1.4 spatial coverage numerator."""
 
     @abc.abstractmethod
-    def continuity_report(self, since_ts: int, until_ts: int,
-                          gap_threshold_s: int) -> Dict[str, Any]:
-        """Per-vehicle reporting-gap stats over [since_ts, until_ts] from the
-        observation log: report continuity ratio, gap count/median/p95, and a
-        churn count of gaps that exceed `gap_threshold_s` (i.e. the vehicle
-        went stale and came back). Layers 3.1, 3.2, 3.4."""
+    def continuity_report(self, since_ts: int, until_ts: int) -> Dict[str, Any]:
+        """Fleet-wide continuity stats over [since_ts, until_ts]: `vehicles`,
+        `observations`, `avg_span_s`, `avg_observations_per_vehicle` come from
+        a live GROUP BY over the observation log; `gaps_total`,
+        `gaps_over_threshold` and `gap_buckets` come from the
+        `analytics_continuity_hour` rollup (see `fold_continuity_gaps`) rather
+        than scanning history directly - a live `LAG()` over the full window
+        is what caused the production 504s this replaced. The gap threshold
+        is a fold-time constant (`aggregator.GAP_THRESHOLD_S`), not a
+        parameter here. Layers 3.1, 3.2, 3.4."""
 
     @abc.abstractmethod
-    def trip_completeness(self, since_ts: int, until_ts: int,
-                          gap_threshold_s: int) -> Dict[str, Any]:
-        """Same gap analysis as `continuity_report`, but partitioned by
-        (vehicle_id, trip_id): the share of trip segments with no internal
-        gap over `gap_threshold_s`. Layer 3.3."""
+    def trip_completeness(self, since_ts: int, until_ts: int) -> Dict[str, Any]:
+        """Trip completeness over [since_ts, until_ts]: `trips` and
+        `complete_trips`, read from the `analytics_trip_gap_state` rollup
+        (see `fold_continuity_gaps`) rather than a live per-trip `LAG()` scan.
+        Layer 3.3."""
+
+    @abc.abstractmethod
+    def fold_continuity_gaps(self, since_ts: int, until_ts: int,
+                             gap_threshold_s: int) -> None:
+        """Process observations in (since_ts, until_ts] into the continuity
+        rollup: per-vehicle and per-(vehicle, trip) gaps against
+        `analytics_vehicle_gap_state` / `analytics_trip_gap_state` (carrying
+        the last-seen ts forward across calls), incrementing
+        `analytics_continuity_hour`'s counters, and advancing the
+        'continuity_watermark_ts' meta key - all in one transaction.
+
+        Unlike `fold_rollups`, this must NOT be re-run over an
+        already-folded range: the counters it writes are additive, not
+        replaced wholesale, so reprocessing a range double-counts. Safety
+        comes from doing the write and the watermark advance atomically, not
+        from idempotency - a crash before commit means nothing was written,
+        so a retry from the unmoved watermark is clean; the caller is what
+        keeps `since_ts` monotonic."""
 
     @abc.abstractmethod
     def referential_integrity(self, since_ts: int) -> Dict[str, Any]:

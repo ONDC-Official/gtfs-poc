@@ -176,5 +176,57 @@ CREATE TABLE IF NOT EXISTS analytics_route_hour (
 );
 CREATE INDEX IF NOT EXISTS ix_route_hour ON analytics_route_hour(hour_bucket);
 
+-- ---------------------------------------------------------------------------
+-- Continuity rollup (Layer 3: report continuity, gap frequency/duration,
+-- trip completeness).
+--
+-- A gap is defined *between two consecutive rows*, so - unlike the grid/route
+-- rollup above - a bucket can't be recomputed in isolation from raw data; it
+-- needs to know the last row from before the bucket. These two small state
+-- tables carry that forward across aggregator passes, and the fold only ever
+-- scans the new rows since the last pass (see services/aggregator.py), never
+-- the full history - which is what keeps this cheap regardless of how much
+-- history has accumulated.
+-- ---------------------------------------------------------------------------
+
+-- "What was this vehicle's most recently processed observation" - lets the
+-- next pass compute a gap against a row it never has to re-read.
+CREATE TABLE IF NOT EXISTS analytics_vehicle_gap_state (
+    vehicle_id TEXT PRIMARY KEY,
+    last_ts    INTEGER NOT NULL
+);
+
+-- Same idea, scoped to one (vehicle, trip): has_gap is sticky - set once,
+-- never cleared - so a trip that had one bad gap stays "incomplete" even
+-- after it resumes reporting normally.
+CREATE TABLE IF NOT EXISTS analytics_trip_gap_state (
+    vehicle_id TEXT    NOT NULL,
+    trip_id    TEXT    NOT NULL,
+    last_ts    INTEGER NOT NULL,
+    has_gap    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (vehicle_id, trip_id)
+);
+CREATE INDEX IF NOT EXISTS ix_trip_gap_last_ts ON analytics_trip_gap_state(last_ts);
+
+-- Fleet-wide hourly rollup of gap stats. Unlike analytics_grid_hour /
+-- analytics_route_hour, these counters are additive (incremented per fold
+-- pass), not replaced wholesale - reprocessing an already-folded row would
+-- double count, which is why the fold is watermark-advance-once rather than
+-- rewind-and-replace.
+CREATE TABLE IF NOT EXISTS analytics_continuity_hour (
+    hour_bucket         INTEGER NOT NULL,
+    gaps_total          INTEGER NOT NULL DEFAULT 0,
+    gaps_over_threshold INTEGER NOT NULL DEFAULT 0,
+    b_0_60              INTEGER NOT NULL DEFAULT 0,
+    b_60_180            INTEGER NOT NULL DEFAULT 0,
+    b_180_300           INTEGER NOT NULL DEFAULT 0,
+    b_300_600           INTEGER NOT NULL DEFAULT 0,
+    b_600_plus          INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour_bucket)
+);
+
 -- Watermark for the incremental rollup, so a restart resumes rather than
 -- rescanning the whole history. Key: 'aggregate_watermark_ts'.
+-- The continuity fold above tracks its own, separate watermark under
+-- 'continuity_watermark_ts' - it must never rewind (see comment above),
+-- so it cannot share the grid/route watermark's rewind-on-restart behaviour.

@@ -15,13 +15,10 @@ from typing import Any, Dict, List, Optional
 
 from ..config import settings
 from ..data.repository import Repository
-from .aggregator import GRID_LAT_DEG, GRID_LON_DEG
+from .aggregator import GAP_THRESHOLD_S, GRID_LAT_DEG, GRID_LON_DEG
 from .geo import point_to_polyline_m
 from .live_analytics import STALE_S, LiveAnalytics
 
-# A vehicle silent for longer than this is counted as a "reporting gap"
-# rather than just the normal spacing between polls.
-GAP_THRESHOLD_S = 90
 FRESH_THRESHOLDS_S = (30, 60, 120, 300)
 OFF_ROUTE_M = 50.0
 # Bound how many of the busiest live routes get an off-route-distance pass,
@@ -147,12 +144,11 @@ class QualityService:
         }
 
     # ---- Layer 3: Continuity -------------------------------------------------
-    def continuity(self, hours: float = 3.0,
-                   gap_threshold_s: int = GAP_THRESHOLD_S) -> Dict[str, Any]:
+    def continuity(self, hours: float = 3.0) -> Dict[str, Any]:
         now = int(time.time())
         since_ts = int(now - hours * 3600)
-        report = self.repo.continuity_report(since_ts, now, gap_threshold_s)
-        trips = self.repo.trip_completeness(since_ts, now, gap_threshold_s)
+        report = self.repo.continuity_report(since_ts, now)
+        trips = self.repo.trip_completeness(since_ts, now)
 
         interval_s = max(settings.rt_poll_seconds, 1)
         avg_span = report.get("avg_span_s") or 0
@@ -168,7 +164,9 @@ class QualityService:
             "vehicles": report.get("vehicles") or 0,
             "gap_frequency": {
                 "gaps_over_threshold": report.get("gaps_over_threshold") or 0,
-                "threshold_s": gap_threshold_s,
+                # Baked in at rollup time (aggregator.GAP_THRESHOLD_S), not a
+                # per-request choice - see fold_continuity_gaps.
+                "threshold_s": GAP_THRESHOLD_S,
                 "pct_of_gaps": _pct(report.get("gaps_over_threshold"), report.get("gaps_total")),
             },
             "gap_duration_distribution": report.get("gap_buckets") or {},

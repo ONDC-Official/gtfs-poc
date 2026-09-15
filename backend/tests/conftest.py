@@ -152,7 +152,9 @@ def _seed_sqlite():
     for table in ("gtfs_agency", "gtfs_routes", "gtfs_stops", "gtfs_trips",
                   "gtfs_stop_times", "gtfs_shapes", "rt_vehicle_position",
                   "rt_vehicle_latest", "rt_poll_log", "meta",
-                  "analytics_grid_hour", "analytics_route_hour"):
+                  "analytics_grid_hour", "analytics_route_hour",
+                  "analytics_continuity_hour", "analytics_vehicle_gap_state",
+                  "analytics_trip_gap_state"):
         conn.execute("DELETE FROM " + table)
 
     for table, (cols, rows) in DATASET.items():
@@ -198,7 +200,9 @@ if _PG_OK:
     _PG_TABLES = ("gtfs_agency", "gtfs_routes", "gtfs_stops", "gtfs_trips",
                   "gtfs_stop_times", "gtfs_shapes", "rt_vehicle_position",
                   "rt_vehicle_latest", "rt_poll_log", "meta",
-                  "analytics_grid_hour", "analytics_route_hour")
+                  "analytics_grid_hour", "analytics_route_hour",
+                  "analytics_continuity_hour", "analytics_vehicle_gap_state",
+                  "analytics_trip_gap_state")
 
     def _seed_postgres():
         with pg.pool().connection() as conn:

@@ -43,6 +43,20 @@ WATERMARK_KEY = "aggregate_watermark_ts"
 # after the bucket opens, so the newest bucket is always incomplete.
 REWIND_S = HOUR
 
+# A vehicle silent for longer than this counts as a "reporting gap" rather
+# than just the normal spacing between polls. Baked in at fold time (like
+# MOVING_MPS/IMPLAUSIBLE_MPS above), not a per-request parameter - the
+# continuity rollup only ever stores counts against this one threshold.
+GAP_THRESHOLD_S = 90
+
+CONTINUITY_WATERMARK_KEY = "continuity_watermark_ts"
+# Unlike WATERMARK_KEY above, this one must never rewind: the continuity
+# rollup is additive, so reprocessing an already-folded range double-counts.
+# A stale watermark (first run against existing history, or recovering from
+# downtime) is caught up incrementally instead, one bounded chunk per pass -
+# see Aggregator._fold_continuity.
+CONTINUITY_CHUNK_S = 86400   # at most one day of backlog per aggregator tick
+
 
 class Aggregator:
     def __init__(self, repo: Repository, interval_s: int = 120):
@@ -111,21 +125,52 @@ class Aggregator:
         # pass rewinds from the older mark and re-folds, which is harmless.
         self.repo.meta_set(WATERMARK_KEY, str(int(newest)))
 
+        continuity = self._fold_continuity(newest)
+
         counts = self.repo.rollup_counts()
         return {
             "rows_scanned": scanned,
             "cells": counts["cells"],
             "routes": counts["routes"],
             "watermark": int(newest),
+            "continuity": continuity,
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
         }
 
+    def _fold_continuity(self, newest: int) -> Dict[str, Any]:
+        """One bounded step of the continuity rollup: at most
+        `CONTINUITY_CHUNK_S` of backlog, so a stale watermark (first run
+        against existing history, or catching up after downtime) is worked
+        off gradually across ticks rather than in one query that would
+        reintroduce the cross-partition scan this rollup exists to avoid.
+        `backend/scripts/backfill_continuity.py` calls the same repo method
+        in a tight loop to catch up faster during a maintenance window.
+        """
+        mark = self.repo.meta_get(CONTINUITY_WATERMARK_KEY)
+        if mark:
+            since = int(mark)
+        else:
+            # Never run before: start at the retention boundary, not at unix
+            # epoch 0. rt_vehicle_position never holds anything older than
+            # history_retention_hours (prune_history), so walking forward
+            # from 0 in CONTINUITY_CHUNK_S-sized steps would spend years of
+            # aggregator ticks re-processing a history that no longer exists.
+            since = max(0, newest - settings.history_retention_hours * 3600)
+        if since >= newest:
+            return {"since": since, "until": since, "chunked": False}
+
+        until = min(since + CONTINUITY_CHUNK_S, newest)
+        self.repo.fold_continuity_gaps(since, until, GAP_THRESHOLD_S)
+        return {"since": since, "until": until, "chunked": until < newest}
+
     def status(self) -> Dict[str, Any]:
         mark = self.repo.meta_get(WATERMARK_KEY)
+        continuity_mark = self.repo.meta_get(CONTINUITY_WATERMARK_KEY)
         return {
             "grid_m": int(GRID_M),
             "interval_s": self.interval_s,
             "watermark_ts": int(mark) if mark else None,
+            "continuity_watermark_ts": int(continuity_mark) if continuity_mark else None,
             "last_run": self.last_run,
             "retention_hours": settings.history_retention_hours,
         }
