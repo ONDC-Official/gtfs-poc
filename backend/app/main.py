@@ -11,7 +11,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .api import deps, routes_analytics, routes_realtime, routes_static, ws
+from .api import deps, routes_analytics, routes_quality, routes_realtime, routes_static, ws
 from .config import settings
 from .data import db
 from .services.realtime import RealtimeService
@@ -63,6 +63,7 @@ app.add_middleware(
 app.include_router(routes_static.router)
 app.include_router(routes_realtime.router)
 app.include_router(routes_analytics.router)
+app.include_router(routes_quality.router)
 app.include_router(ws.router)
 
 

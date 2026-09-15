@@ -2,14 +2,16 @@ import { useState } from 'react'
 import { useLiveVehicles } from './useLiveVehicles'
 import { LiveView } from './views/LiveView'
 import { AnalyticsView } from './views/AnalyticsView'
+import { QualityView } from './views/QualityView'
 import { Dot } from './components/ui'
 import { ago } from './format'
 
-type ViewId = 'live' | 'analytics'
+type ViewId = 'live' | 'analytics' | 'quality'
 
 const VIEWS: { id: ViewId; label: string; hint: string }[] = [
   { id: 'live', label: 'Live', hint: 'Where every bus is right now' },
   { id: 'analytics', label: 'Analytics', hint: 'Patterns over the recorded history' },
+  { id: 'quality', label: 'Quality', hint: 'Is this feed trustworthy?' },
 ]
 
 export default function App() {
@@ -82,6 +84,9 @@ export default function App() {
       </div>
       <div style={{ display: view === 'analytics' ? 'grid' : 'none', minHeight: 0 }}>
         <AnalyticsView />
+      </div>
+      <div style={{ display: view === 'quality' ? 'grid' : 'none', minHeight: 0 }}>
+        <QualityView />
       </div>
     </div>
   )

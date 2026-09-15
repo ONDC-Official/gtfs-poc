@@ -24,7 +24,7 @@ def _rows(cur) -> List[Dict[str, Any]]:
 
 class SqliteRepository(Repository):
     # ---- static -----------------------------------------------------------
-    def feed_summary(self) -> Dict[str, Any]:
+    def static_feed_meta(self) -> Dict[str, Any]:
         c = db.get_connection()
         out: Dict[str, Any] = {}
         for table, key in (
@@ -40,7 +40,11 @@ class SqliteRepository(Repository):
         out["bbox"] = dict(bbox) if bbox and bbox["min_lat"] is not None else None
         loaded = c.execute("SELECT value FROM meta WHERE key='static_loaded_at'").fetchone()
         out["static_loaded_at"] = int(loaded["value"]) if loaded else None
-        out["history_rows"] = c.execute(
+        return out
+
+    def feed_summary(self) -> Dict[str, Any]:
+        out = self.static_feed_meta()
+        out["history_rows"] = db.get_connection().execute(
             "SELECT COUNT(*) AS n FROM rt_vehicle_position").fetchone()["n"]
         return out
 
@@ -525,6 +529,111 @@ class SqliteRepository(Repository):
             "SUM(speed_sum) AS speed_sum, SUM(speed_n) AS speed_n "
             "FROM analytics_route_hour WHERE hour_bucket >= ? "
             "GROUP BY hour_bucket ORDER BY hour_bucket", (since_ts,)))
+
+    # ---- quality tier -------------------------------------------------------
+    def route_coverage_by_hour(self, since_ts: int) -> List[Dict[str, Any]]:
+        c = db.get_connection()
+        return _rows(c.execute(
+            "SELECT hod, weekend, AVG(routes) AS avg_routes_live, COUNT(*) AS samples "
+            "FROM ("
+            "  SELECT hour_bucket, "
+            "         CAST(strftime('%H', hour_bucket, 'unixepoch') AS INTEGER) AS hod, "
+            "         CASE WHEN CAST(strftime('%w', hour_bucket, 'unixepoch') AS INTEGER) "
+            "              IN (0, 6) THEN 1 ELSE 0 END AS weekend, "
+            "         COUNT(DISTINCT route_id) AS routes "
+            "  FROM analytics_route_hour WHERE hour_bucket >= ? GROUP BY hour_bucket"
+            ") GROUP BY hod, weekend ORDER BY hod, weekend", (since_ts,)))
+
+    def distinct_grid_cells(self, since_ts: int) -> int:
+        c = db.get_connection()
+        return c.execute(
+            "SELECT COUNT(*) AS n FROM "
+            "(SELECT DISTINCT cell_y, cell_x FROM analytics_grid_hour WHERE hour_bucket >= ?)",
+            (since_ts,)).fetchone()["n"]
+
+    def continuity_report(self, since_ts: int, until_ts: int,
+                          gap_threshold_s: int) -> Dict[str, Any]:
+        c = db.get_connection()
+        totals = c.execute(
+            "WITH ordered AS ("
+            "  SELECT vehicle_id, ts - LAG(ts) OVER (PARTITION BY vehicle_id ORDER BY ts) AS gap "
+            "  FROM rt_vehicle_position WHERE ts BETWEEN ? AND ?"
+            "), per_vehicle AS ("
+            "  SELECT vehicle_id, COUNT(*) AS observations, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
+            "  FROM rt_vehicle_position WHERE ts BETWEEN ? AND ? GROUP BY vehicle_id"
+            ") "
+            "SELECT (SELECT COUNT(*) FROM per_vehicle) AS vehicles, "
+            "(SELECT COALESCE(SUM(observations), 0) FROM per_vehicle) AS observations, "
+            "(SELECT COUNT(*) FROM ordered WHERE gap IS NOT NULL) AS gaps_total, "
+            "(SELECT COUNT(*) FROM ordered WHERE gap > ?) AS gaps_over_threshold, "
+            "(SELECT AVG(last_ts - first_ts) FROM per_vehicle) AS avg_span_s, "
+            "(SELECT AVG(observations * 1.0) FROM per_vehicle) AS avg_observations_per_vehicle",
+            (since_ts, until_ts, since_ts, until_ts, gap_threshold_s)).fetchone()
+        buckets = c.execute(
+            "WITH ordered AS ("
+            "  SELECT ts - LAG(ts) OVER (PARTITION BY vehicle_id ORDER BY ts) AS gap "
+            "  FROM rt_vehicle_position WHERE ts BETWEEN ? AND ?"
+            ") "
+            "SELECT "
+            "SUM(CASE WHEN gap > 0 AND gap <= 60 THEN 1 ELSE 0 END) AS b_0_60, "
+            "SUM(CASE WHEN gap > 60 AND gap <= 180 THEN 1 ELSE 0 END) AS b_60_180, "
+            "SUM(CASE WHEN gap > 180 AND gap <= 300 THEN 1 ELSE 0 END) AS b_180_300, "
+            "SUM(CASE WHEN gap > 300 AND gap <= 600 THEN 1 ELSE 0 END) AS b_300_600, "
+            "SUM(CASE WHEN gap > 600 THEN 1 ELSE 0 END) AS b_600_plus "
+            "FROM ordered WHERE gap IS NOT NULL", (since_ts, until_ts)).fetchone()
+        out = dict(totals)
+        out["gap_buckets"] = dict(buckets)
+        return out
+
+    def trip_completeness(self, since_ts: int, until_ts: int,
+                          gap_threshold_s: int) -> Dict[str, Any]:
+        c = db.get_connection()
+        row = c.execute(
+            "WITH ordered AS ("
+            "  SELECT vehicle_id, trip_id, "
+            "         ts - LAG(ts) OVER (PARTITION BY vehicle_id, trip_id ORDER BY ts) AS gap "
+            "  FROM rt_vehicle_position "
+            "  WHERE ts BETWEEN ? AND ? AND trip_id IS NOT NULL"
+            "), per_trip AS ("
+            "  SELECT vehicle_id, trip_id, "
+            "         MAX(CASE WHEN gap > ? THEN 1 ELSE 0 END) AS has_gap "
+            "  FROM ordered GROUP BY vehicle_id, trip_id"
+            ") "
+            "SELECT COUNT(*) AS trips, COALESCE(SUM(1 - has_gap), 0) AS complete_trips "
+            "FROM per_trip", (since_ts, until_ts, gap_threshold_s)).fetchone()
+        return dict(row)
+
+    def referential_integrity(self, since_ts: int) -> Dict[str, Any]:
+        c = db.get_connection()
+        row = c.execute(
+            "SELECT COUNT(*) AS total, "
+            "SUM(CASE WHEN route_id IS NOT NULL AND route_id NOT IN "
+            "     (SELECT route_id FROM gtfs_routes) THEN 1 ELSE 0 END) AS invalid_route_id, "
+            "SUM(CASE WHEN trip_id IS NOT NULL AND trip_id NOT IN "
+            "     (SELECT trip_id FROM gtfs_trips) THEN 1 ELSE 0 END) AS invalid_trip_id "
+            "FROM rt_vehicle_position WHERE ts >= ?", (since_ts,)).fetchone()
+        return dict(row)
+
+    def field_population(self, since_ts: int) -> Dict[str, Dict[str, int]]:
+        c = db.get_connection()
+        row = c.execute(
+            "SELECT COUNT(*) AS total, COUNT(stop_id) AS stop_id, "
+            "COUNT(occupancy_status) AS occupancy_status, "
+            "COUNT(congestion_level) AS congestion_level, "
+            "COUNT(current_status) AS current_status, COUNT(bearing) AS bearing, "
+            "COUNT(speed) AS speed, COUNT(trip_id) AS trip_id, "
+            "COUNT(route_id) AS route_id, COUNT(lat) AS lat "
+            "FROM rt_vehicle_position WHERE ts >= ?", (since_ts,)).fetchone()
+        row = dict(row)
+        total = row.pop("total")
+        return {field: {"populated": n, "total": total} for field, n in row.items()}
+
+    def poll_series(self, since_ts: int) -> List[Dict[str, Any]]:
+        c = db.get_connection()
+        return _rows(c.execute(
+            "SELECT polled_at, ok, source, http_status, entity_count, new_rows, "
+            "feed_timestamp, latency_ms, error FROM rt_poll_log "
+            "WHERE polled_at >= ? ORDER BY polled_at", (since_ts,)))
 
 
 repository: Repository = SqliteRepository()

@@ -15,6 +15,14 @@ class Repository(abc.ABC):
         """Row counts + bounding box for the loaded static feed."""
 
     @abc.abstractmethod
+    def static_feed_meta(self) -> Dict[str, Any]:
+        """Everything `feed_summary` returns except `history_rows`: that field
+        is a COUNT(*) over the (unbounded, constantly-written) realtime history
+        table, expensive enough under a live poller that a caller which only
+        wants the static counts and bbox - the quality tier, notably - should
+        not have to pay for it."""
+
+    @abc.abstractmethod
     def list_routes(self, q: Optional[str], limit: int, offset: int) -> Dict[str, Any]: ...
 
     @abc.abstractmethod
@@ -154,3 +162,45 @@ class Repository(abc.ABC):
     @abc.abstractmethod
     def rollup_counts(self) -> Dict[str, int]:
         """Row counts of the rollup tables, as {"cells": n, "routes": n}."""
+
+    # ---- quality tier -------------------------------------------------------
+    @abc.abstractmethod
+    def route_coverage_by_hour(self, since_ts: int) -> List[Dict[str, Any]]:
+        """Distinct live routes per (hour-of-day, is_weekend) bucket, from the
+        route-hour rollup. Layer 1.5 temporal coverage."""
+
+    @abc.abstractmethod
+    def distinct_grid_cells(self, since_ts: int) -> int:
+        """Count of base-resolution grid cells with >=1 observation since
+        `since_ts`. Layer 1.4 spatial coverage numerator."""
+
+    @abc.abstractmethod
+    def continuity_report(self, since_ts: int, until_ts: int,
+                          gap_threshold_s: int) -> Dict[str, Any]:
+        """Per-vehicle reporting-gap stats over [since_ts, until_ts] from the
+        observation log: report continuity ratio, gap count/median/p95, and a
+        churn count of gaps that exceed `gap_threshold_s` (i.e. the vehicle
+        went stale and came back). Layers 3.1, 3.2, 3.4."""
+
+    @abc.abstractmethod
+    def trip_completeness(self, since_ts: int, until_ts: int,
+                          gap_threshold_s: int) -> Dict[str, Any]:
+        """Same gap analysis as `continuity_report`, but partitioned by
+        (vehicle_id, trip_id): the share of trip segments with no internal
+        gap over `gap_threshold_s`. Layer 3.3."""
+
+    @abc.abstractmethod
+    def referential_integrity(self, since_ts: int) -> Dict[str, Any]:
+        """Counts of live vehicles whose route_id/trip_id do not exist in the
+        static schedule. Layer 4.4."""
+
+    @abc.abstractmethod
+    def field_population(self, since_ts: int) -> Dict[str, Dict[str, int]]:
+        """Per-field {populated, total} counts over recent history, for every
+        optional GTFS-realtime field. Layer 5.1."""
+
+    @abc.abstractmethod
+    def poll_series(self, since_ts: int) -> List[Dict[str, Any]]:
+        """Poll log rows since `since_ts`, oldest first - a time-bounded
+        counterpart to `recent_polls` for volume-stability and error-breakdown
+        stats that need a full window rather than a row count. Layers 6.2, 6.3."""

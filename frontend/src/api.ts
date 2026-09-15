@@ -1,7 +1,9 @@
 import type {
   AggregatorStatus, CorridorResponse, DarkRoute, FeedStatus, FeedSummary,
   GridResponse, HotspotResponse, HourlyPoint, IngestPoint, LiveAnalytics,
-  Overview, PollLog, RouteStop, RouteSummary, SpeedBin, TopRoute, Vehicle,
+  Overview, PollLog, QualityContinuity, QualityCorrectness, QualityCoverage,
+  QualityFieldRichness, QualityFreshness, QualitySourceReliability,
+  QualitySummary, RouteStop, RouteSummary, SpeedBin, TopRoute, Vehicle,
 } from './types'
 
 // BASE_URL is '/gtfs/' in production (see vite.config.ts), '/' in dev.
@@ -49,4 +51,15 @@ export const api = {
   vehicleHistory: (id: string, minutes = 60) =>
     get<{ geometry: GeoJSON.LineString; count: number }>(
       `/api/realtime/vehicles/${encodeURIComponent(id)}/history?minutes=${minutes}`),
+
+  // ---- quality tier ----
+  qualityCoverage: (days = 3) => get<QualityCoverage>(`/api/quality/coverage?days=${days}`),
+  qualityFreshness: () => get<QualityFreshness>('/api/quality/freshness'),
+  qualityContinuity: (hours = 3) => get<QualityContinuity>(`/api/quality/continuity?hours=${hours}`),
+  qualityCorrectness: (hours = 1) => get<QualityCorrectness>(`/api/quality/correctness?hours=${hours}`),
+  qualityFieldRichness: (hours = 1) =>
+    get<QualityFieldRichness>(`/api/quality/field-richness?hours=${hours}`),
+  qualitySourceReliability: (hours = 24) =>
+    get<QualitySourceReliability>(`/api/quality/source-reliability?hours=${hours}`),
+  qualitySummary: () => get<QualitySummary>('/api/quality/summary'),
 }

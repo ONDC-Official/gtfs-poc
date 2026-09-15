@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     # from the static feed so the full stack is demonstrable offline.
     rt_mock_when_unconfigured: bool = True
 
+    # Baseline for the quality tier's fleet coverage ratio (active vehicles /
+    # expected fleet). No feed we've seen publishes this, so it stays unset
+    # (metric reports null) until an operator supplies it out of band.
+    expected_fleet_size: Optional[int] = None
+
     # ---- retention --------------------------------------------------------
     # How much position history the data plane keeps for the analytics tier.
     # The live Delhi feed carries ~5,700 vehicles, so a 30s cadence writes on

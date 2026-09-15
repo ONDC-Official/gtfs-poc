@@ -15,6 +15,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ..data.repository import Repository
+from .geo import haversine_m as _haversine_m
 
 MPS_TO_KMH = 3.6
 
@@ -26,13 +27,6 @@ MOVING_MPS = 0.5
 IMPLAUSIBLE_MPS = 20.0
 BUNCH_M = 300.0       # two buses on one route this close are bunched
 CACHE_TTL_S = 5.0
-
-
-def _haversine_m(lat1, lon1, lat2, lon2) -> float:
-    mlat = math.radians((lat1 + lat2) / 2.0)
-    dy = math.radians(lat2 - lat1) * 6371000.0
-    dx = math.radians(lon2 - lon1) * 6371000.0 * math.cos(mlat)
-    return math.hypot(dx, dy)
 
 
 def _percentile(values: List[float], p: float) -> Optional[float]:

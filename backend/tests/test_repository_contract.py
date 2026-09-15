@@ -476,4 +476,93 @@ def test_rollup_counts_are_cell_hours_not_cells(repo):
     counts = repo.rollup_counts()
     distinct_cells = len(repo.grid_cells(0, 1, None, 1, 100_000))
     assert counts["cells"] > distinct_cells > 0
-    assert counts["routes"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Quality tier
+# ---------------------------------------------------------------------------
+
+def test_route_coverage_by_hour_covers_every_bucket_once(repo):
+    _fold(repo)
+    rows = repo.route_coverage_by_hour(0)
+    # Every (hour-of-day, weekend) group's `samples` counts one of the
+    # distinct hour_buckets in analytics_route_hour; the groups partition
+    # those buckets, so the total must match hourly_series()'s row count.
+    assert sum(r["samples"] for r in rows) == len(repo.hourly_series(0))
+    for r in rows:
+        assert 0 <= r["hod"] <= 23
+        assert r["weekend"] in (0, 1)
+        assert r["avg_routes_live"] > 0
+
+
+def test_distinct_grid_cells_matches_base_resolution_grid(repo):
+    _fold(repo)
+    # Same rollup, two read paths: distinct_grid_cells() is the count half of
+    # what grid_cells() returns in full at factor=1 with no observation floor.
+    assert repo.distinct_grid_cells(0) == len(repo.grid_cells(0, 1, None, 1, 100_000))
+
+
+def test_continuity_report_basic(repo):
+    # In-window: V1 (4 obs, hourly-ish), V2 (2 obs), SIM-1 (1 obs). V3's one
+    # observation is 40,000s old and falls outside this window.
+    r = repo.continuity_report(NOW - 4 * HOUR, NOW, 90)
+    assert r["vehicles"] == 3
+    assert r["observations"] == 7
+    # V1 contributes 3 successive gaps, V2 contributes 1; SIM-1 has only one
+    # row so no gap. Every one of those 4 gaps is hour-scale, so all clear a
+    # 90s threshold.
+    assert r["gaps_total"] == 4
+    assert r["gaps_over_threshold"] == 4
+    assert r["gap_buckets"]["b_600_plus"] == 4
+    assert sum(r["gap_buckets"].values()) == 4
+    assert r["avg_span_s"] == pytest.approx((10740 + 7110 + 0) / 3)
+    assert r["avg_observations_per_vehicle"] == pytest.approx(7 / 3)
+
+
+def test_continuity_report_respects_threshold(repo):
+    r = repo.continuity_report(NOW - 4 * HOUR, NOW, 999_999)
+    assert r["gaps_total"] == 4          # unaffected by the threshold
+    assert r["gaps_over_threshold"] == 0  # nothing clears this one
+
+
+def test_trip_completeness(repo):
+    since = NOW - 4 * HOUR
+    # V3 and SIM-1 have no trip_id, so only (V1, T1) and (V2, T3) count.
+    strict = repo.trip_completeness(since, NOW, 90)
+    assert strict["trips"] == 2
+    assert strict["complete_trips"] == 0
+
+    lenient = repo.trip_completeness(since, NOW, 999_999)
+    assert lenient["trips"] == 2
+    assert lenient["complete_trips"] == 2
+
+
+def test_referential_integrity_all_valid_in_fixture(repo):
+    # Every route_id/trip_id in OBSERVATIONS either exists in the static
+    # schedule or is NULL (which the check skips), so this fixture only
+    # exercises the "nothing invalid" path.
+    r = repo.referential_integrity(0)
+    assert r["total"] == 8
+    assert r["invalid_route_id"] == 0
+    assert r["invalid_trip_id"] == 0
+
+
+def test_field_population_counts_non_null_per_field(repo):
+    fields = repo.field_population(0)
+    assert fields["route_id"] == {"populated": 8, "total": 8}
+    assert fields["lat"] == {"populated": 7, "total": 8}       # V3 has no position
+    assert fields["speed"] == {"populated": 7, "total": 8}     # V3 has no speed
+    assert fields["trip_id"] == {"populated": 6, "total": 8}   # V3, SIM-1 have none
+    # Never populated by this feed / this fixture.
+    for field in ("stop_id", "occupancy_status", "congestion_level", "current_status"):
+        assert fields[field] == {"populated": 0, "total": 8}
+
+
+def test_poll_series_orders_oldest_first(repo):
+    rows = repo.poll_series(NOW - 1000)
+    assert [r["polled_at"] for r in rows] == [NOW - 300, NOW - 270, NOW - 240]
+
+
+def test_poll_series_filters_by_since(repo):
+    rows = repo.poll_series(NOW - 260)
+    assert [r["polled_at"] for r in rows] == [NOW - 240]

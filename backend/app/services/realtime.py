@@ -183,6 +183,8 @@ class RealtimeService:
             new_rows = await asyncio.to_thread(self.repo.upsert_vehicles, rows)
             for r in rows:
                 self.snapshot[r["vehicle_id"]] = r
+            if source == "feed":
+                await asyncio.to_thread(self._check_schema, rows, ingested_at)
 
         ok = error is None and bool(rows)
         self.status.update({
@@ -216,6 +218,17 @@ class RealtimeService:
             "vehicles": wire,
         })
         return {"ok": ok, "entities": len(rows), "new_rows": new_rows, "error": error}
+
+    def _check_schema(self, rows: List[Dict[str, Any]], now: int) -> None:
+        """Layer 6.4 (source reliability): fingerprint which optional fields
+        this batch actually carries, so a silent field-set change at the
+        endpoint shows up as a dated event instead of just quietly shifting
+        the field-population numbers."""
+        fields_present = ",".join(sorted(
+            {k for r in rows for k, v in r.items() if v is not None}))
+        if fields_present != (self.repo.meta_get("rt_schema_fields") or ""):
+            self.repo.meta_set("rt_schema_fields", fields_present)
+            self.repo.meta_set("rt_schema_changed_at", str(now))
 
     async def _fetch_feed(self):
         """Returns (rows, http_status, feed_timestamp, error)."""

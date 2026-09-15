@@ -10,6 +10,7 @@ from ..data.repository import Repository
 from ..services.analytics import AnalyticsService
 from ..services.aggregator import Aggregator
 from ..services.live_analytics import LiveAnalytics
+from ..services.quality import QualityService
 from ..services.realtime import RealtimeService
 from ..services.spatial_analytics import SpatialAnalytics
 
@@ -28,6 +29,7 @@ analytics = AnalyticsService(repository)
 live_analytics = LiveAnalytics(repository)
 spatial = SpatialAnalytics(repository)
 aggregator = Aggregator(repository)
+quality = QualityService(repository, live_analytics)
 realtime: Optional[RealtimeService] = None
 
 

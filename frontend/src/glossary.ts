@@ -145,6 +145,109 @@ export const GLOSSARY = {
         + 'reporting. Some are genuinely unserved right now; others may be '
         + 'served by buses broadcasting a different route id.',
   },
+
+  // ---- quality tier ----
+  fleetCoverageRatio: {
+    title: 'Fleet coverage ratio',
+    body: 'Active vehicles divided by the operator’s expected fleet size. '
+        + 'Shows as — until an expected fleet size is configured, since '
+        + 'no feed publishes that number itself.',
+    rule: 'active vehicles ÷ EXPECTED_FLEET_SIZE',
+  },
+  spatialCoverage: {
+    title: 'Spatial coverage',
+    body: 'Share of the service area’s 250 m grid cells that have logged '
+        + 'at least one observation over the window — gaps here are places '
+        + 'the feed never touches, not just quiet ones.',
+    rule: 'cells with ≥ 1 observation ÷ cells across the static bounding box',
+  },
+  temporalCoverage: {
+    title: 'Temporal coverage',
+    body: 'Average live-route count by hour of day, split weekday vs weekend. '
+        + 'Finds gaps a single current snapshot would hide — service that '
+        + 'goes dark at particular hours.',
+  },
+  reportContinuity: {
+    title: 'Report continuity',
+    body: 'For vehicles seen in the window, how many of their expected update '
+        + 'slots actually arrived, based on the polling interval.',
+    rule: 'observations ÷ (time span ÷ poll interval + 1), per vehicle, averaged',
+  },
+  reportingGap: {
+    title: 'Reporting gap',
+    body: 'A silence between two observations from the same vehicle longer '
+        + 'than the gap threshold — long enough that the vehicle is more '
+        + 'than just between polls.',
+    rule: 'gap between successive reports > 90s',
+  },
+  tripCompleteness: {
+    title: 'Trip completeness',
+    body: 'Share of observed (vehicle, trip) segments with no internal '
+        + 'reporting gap over the threshold — whether a bus is tracked '
+        + 'continuously from when its trip starts to when it ends.',
+  },
+  sessionChurn: {
+    title: 'Session churn',
+    body: 'How often vehicles go quiet past the gap threshold and then come '
+        + 'back, rather than reporting continuously or dropping off for good.',
+  },
+  offRoute: {
+    title: 'Off-route distance',
+    body: 'Distance from a live vehicle’s reported position to the nearest '
+        + 'point on its route’s scheduled shape. Large values mean either a '
+        + 'genuinely off-course bus or a route/trip_id mismatch in the feed.',
+    rule: 'point-to-polyline distance; within 50 m counts as on-route',
+  },
+  coordinateValidity: {
+    title: 'Coordinate validity',
+    body: 'Live positions checked against the static feed’s bounding box '
+        + 'and for exact (0, 0) placeholders — both signs of a broken GPS '
+        + 'fix rather than a real location.',
+  },
+  referentialIntegrity: {
+    title: 'Referential integrity',
+    body: 'Share of live vehicles whose route_id or trip_id doesn’t exist '
+        + 'in the static schedule at all. On this feed the trip_id is '
+        + 'dispatch-encoded and does not join to gtfs_trips, so this number is '
+        + 'expected to run high — it is not itself a fault.',
+  },
+  duplicateSnapshot: {
+    title: 'Duplicate-snapshot rate',
+    body: 'Share of polls that returned data the feed had not actually '
+        + 'refreshed since the previous poll — a sign the poll interval is '
+        + 'tighter than the feed’s own publish cadence.',
+    rule: 'polls with new_rows = 0 ÷ all successful polls',
+  },
+  fieldPopulation: {
+    title: 'Field population rate',
+    body: 'Share of recent records where a given optional GTFS-realtime field '
+        + 'is actually filled in, rather than left null. What a feed sends is '
+        + 'as much a quality signal as whether the values it sends are correct.',
+  },
+  pollSuccessRate: {
+    title: 'Poll success rate',
+    body: 'Share of feed polls in the window that returned a valid, '
+        + 'parseable response.',
+  },
+  feedVolumeStability: {
+    title: 'Feed volume stability',
+    body: 'How much the number of vehicles in each poll varies. A poll under '
+        + 'half the running mean is flagged as an unexplained drop rather than '
+        + 'normal off-peak variation.',
+  },
+  schemaStability: {
+    title: 'Schema stability',
+    body: 'The set of realtime fields the feed is currently sending, and when '
+        + 'that set last changed. A silent field-set change can break a '
+        + 'consumer that was built against the old shape.',
+  },
+  compositeQos: {
+    title: 'Composite QoS score',
+    body: 'An unweighted average of five headline metrics — route '
+        + 'coverage, freshness within 60s, report continuity, 100 minus the '
+        + 'implausible-speed rate, and poll success rate. A simple heuristic '
+        + 'for a single trend line, not an authoritative index.',
+  },
 } as const satisfies Record<string, Term>
 
 export type TermId = keyof typeof GLOSSARY

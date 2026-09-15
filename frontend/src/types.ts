@@ -221,3 +221,92 @@ export interface AggregatorStatus {
     watermark: number; elapsed_ms: number
   } | null
 }
+
+// ---- quality tier -----------------------------------------------------------
+
+export interface QualityCoverage {
+  generated_at: number
+  fleet_coverage_ratio: { active: number; expected: number | null; pct: number | null }
+  route_coverage: {
+    routes_scheduled: number; routes_live: number; routes_dark: number
+    pct_live: number | null
+  }
+  dark_route_load: DarkRoute[]
+  spatial_coverage: {
+    cells_observed: number; cells_total: number | null; pct: number | null
+    window_days: number
+  }
+  temporal_coverage: {
+    hour: number; weekend: boolean; avg_routes_live: number
+    pct_live: number | null; samples: number
+  }[]
+}
+
+export interface QualityFreshness {
+  generated_at: number
+  fresh_within_s: Record<string, { count: number; pct: number | null }>
+  per_vehicle_staleness: {
+    b_0_60: number; b_60_180: number; b_180_300: number; b_300_600: number; b_600_plus: number
+  }
+  feed_age_at_source_s: number | null
+  native_publish_cadence_s: number | null
+  end_to_end_latency_ms: {
+    onboard_to_source_s: number | null; publish_delay_s: number | null; ingest_ms: number | null
+  }
+}
+
+export interface QualityContinuity {
+  generated_at: number
+  window_hours: number
+  report_continuity_pct: number | null
+  vehicles: number
+  gap_frequency: { gaps_over_threshold: number; threshold_s: number; pct_of_gaps: number | null }
+  gap_duration_distribution: Record<string, number | null>
+  trip_completeness: { trips: number; complete_trips: number; pct: number | null }
+  session_churn: number
+}
+
+export interface QualityCorrectness {
+  generated_at: number
+  implausible_speed: number
+  implausible_speed_pct: number | null
+  off_route: {
+    sampled: number; within_50m: number; pct_within_50m: number | null
+    avg_distance_m: number | null; routes_sampled: number
+  }
+  coordinate_validity: { total: number; out_of_bounds: number; zero_coord: number }
+  referential_integrity: { total: number; invalid_route_id: number; invalid_trip_id: number }
+  duplicate_snapshot_rate: { polls: number; duplicates: number; pct: number | null }
+}
+
+export interface QualityFieldRichness {
+  generated_at: number
+  field_population: Record<string, { populated: number; total: number; pct: number | null }>
+  static_feed: {
+    routes: number; stops: number; trips: number; shape_points: number
+    static_loaded_at: number | null; age_days: number | null
+  }
+}
+
+export interface QualitySourceReliability {
+  generated_at: number
+  window_hours: number
+  poll_success_rate: { polls: number; ok: number; pct: number | null }
+  error_breakdown: Record<string, number>
+  feed_volume_stability: {
+    mean_entities: number | null; stdev_entities: number
+    min_entities: number | null; max_entities: number | null; unstable: boolean
+  }
+  schema_stability: { fields: string[]; last_changed_at: number | null }
+}
+
+export interface QualitySummary {
+  generated_at: number
+  composite_qos_score: number | null
+  coverage: QualityCoverage
+  freshness: QualityFreshness
+  continuity: QualityContinuity
+  correctness: QualityCorrectness
+  field_richness: QualityFieldRichness
+  source_reliability: QualitySourceReliability
+}
