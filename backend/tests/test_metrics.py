@@ -1,4 +1,4 @@
-"""/metrics exposition: valid Prometheus text, covering both adapters.
+"""/api/metrics exposition: valid Prometheus text, covering both adapters.
 
 Doesn't go through the ASGI app (that would start the realtime poller and
 aggregator background loops via the lifespan) - the collector only needs a

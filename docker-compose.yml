@@ -4,7 +4,7 @@
 #   loader      data plane   one-shot: GTFS static .txt -> SQLite, then exits
 #   api         service tier FastAPI + the 30s realtime poller
 #   web         UI tier      nginx serving the React bundle and fronting the API
-#   prometheus  observability  scrapes the quality metrics at api:8000/metrics
+#   prometheus  observability  scrapes the quality metrics at api:8000/api/metrics
 #
 # Start:  docker compose up -d --build      then open http://localhost:8080
 #
@@ -123,10 +123,11 @@ services:
     restart: unless-stopped
     logging: *logging
 
-  # Scrapes /metrics on the api container directly over this compose network -
-  # never proxied through nginx, same as the container healthcheck. Not behind
-  # a profile: it works against either storage backend, since the metrics it
-  # scrapes come from QualityService, not from the database directly.
+  # Scrapes /api/metrics on the api container directly over this compose
+  # network - never through nginx, same as the container healthcheck (see
+  # prometheus/prometheus.yml's metrics_path). Not behind a profile: it works
+  # against either storage backend, since the metrics it scrapes come from
+  # QualityService, not from the database directly.
   prometheus:
     image: prom/prometheus:latest
     depends_on:

@@ -7,9 +7,11 @@ just reshapes that one dict into Prometheus's wire format on every scrape,
 instead of maintaining ~50 stateful gauges across the app's lifetime that
 could otherwise go stale if a background updater ever stalled.
 
-Mounted at plain GET /metrics (Prometheus convention), not under /api/, and
-not proxied through nginx - Prometheus scrapes the api container directly
-over the docker-compose network, the same way the healthcheck already does.
+Mounted at GET /api/metrics - under /api/ rather than Prometheus's usual bare
+/metrics, so it rides the same nginx proxy rules (/api/, /gtfs/api/) every
+other endpoint already uses instead of needing its own location block.
+Prometheus's scrape config points `metrics_path` at this explicitly, since
+its own default is the bare /metrics this deliberately isn't at.
 """
 from typing import Any, Dict, Iterable, Optional
 
@@ -19,7 +21,7 @@ from prometheus_client.core import GaugeMetricFamily
 
 from . import deps
 
-router = APIRouter(tags=["metrics"])
+router = APIRouter(prefix="/api", tags=["metrics"])
 
 
 def _gauge(name: str, doc: str, value: Optional[float],
