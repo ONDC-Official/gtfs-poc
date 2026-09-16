@@ -1,9 +1,10 @@
 # ---------------------------------------------------------------------------
-# Delhi Bus Network - three tiers, three services.
+# Delhi Bus Network - four tiers, four services.
 #
-#   loader  data plane   one-shot: GTFS static .txt -> SQLite, then exits
-#   api     service tier FastAPI + the 30s realtime poller
-#   web     UI tier      nginx serving the React bundle and fronting the API
+#   loader      data plane   one-shot: GTFS static .txt -> SQLite, then exits
+#   api         service tier FastAPI + the 30s realtime poller
+#   web         UI tier      nginx serving the React bundle and fronting the API
+#   prometheus  observability  scrapes the quality metrics at api:8000/metrics
 #
 # Start:  docker compose up -d --build      then open http://localhost:8080
 #
@@ -13,6 +14,12 @@
 #   That starts the `db` service and points the api at it. `db` is behind a
 #   compose profile, so a plain `up` never touches it and the SQLite path is
 #   byte-for-byte unchanged.
+#
+# Metrics/Grafana:
+#   prometheus is always started (metrics work on either storage backend) and
+#   binds to PROMETHEUS_PORT (default 127.0.0.1:9090) so an existing Grafana
+#   instance elsewhere on the host can add it as a datasource - this repo does
+#   not ship its own Grafana container. Import grafana/dashboard.json there.
 # ---------------------------------------------------------------------------
 
 name: delhi-gtfs
@@ -116,9 +123,28 @@ services:
     restart: unless-stopped
     logging: *logging
 
+  # Scrapes /metrics on the api container directly over this compose network -
+  # never proxied through nginx, same as the container healthcheck. Not behind
+  # a profile: it works against either storage backend, since the metrics it
+  # scrapes come from QualityService, not from the database directly.
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-127.0.0.1:9090}:9090"
+    restart: unless-stopped
+    logging: *logging
+
 volumes:
   # The SQLite database. Realtime history lives here and grows with retention,
   # so keep it on a volume rather than in the container's writable layer.
   gtfs-data:
   # PostgreSQL data directory, used only under the `postgres` profile.
   pg-data:
+  # Prometheus's own TSDB, so scrape history survives a container restart.
+  prometheus-data:
