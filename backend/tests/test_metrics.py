@@ -13,7 +13,6 @@ from app.api.metrics import _quality_metrics
 from app.services import quality as quality_module
 from app.services.aggregator import (GAP_THRESHOLD_S, GRID_LAT_DEG, GRID_LON_DEG,
                                      HOUR, IMPLAUSIBLE_MPS, MOVING_MPS)
-from app.services.live_analytics import LiveAnalytics
 from app.services.quality import QualityService
 
 
@@ -37,7 +36,7 @@ def _render(repo, monkeypatch) -> str:
     # continuity one - fold it too so that metric has something to report.
     repo.fold_rollups(0, GRID_LAT_DEG, GRID_LON_DEG, HOUR, MOVING_MPS, IMPLAUSIBLE_MPS)
 
-    quality = QualityService(repo, LiveAnalytics(repo))
+    quality = QualityService(repo)
     data = quality.summary()
 
     registry = CollectorRegistry()

@@ -15,7 +15,6 @@ from conftest import NOW
 
 from app.services import quality as quality_module
 from app.services.aggregator import GAP_THRESHOLD_S
-from app.services.live_analytics import LiveAnalytics
 from app.services.quality import QualityService
 
 
@@ -34,7 +33,7 @@ def test_continuity_report_continuity_pct_across_adapters(repo, monkeypatch):
     """
     monkeypatch.setattr(quality_module.time, "time", lambda: NOW)
     repo.fold_continuity_gaps(0, NOW, GAP_THRESHOLD_S)
-    quality = QualityService(repo, LiveAnalytics(repo))
+    quality = QualityService(repo)
 
     result = quality.continuity(hours=4.0)
 

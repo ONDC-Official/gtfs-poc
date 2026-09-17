@@ -29,7 +29,7 @@ analytics = AnalyticsService(repository)
 live_analytics = LiveAnalytics(repository)
 spatial = SpatialAnalytics(repository)
 aggregator = Aggregator(repository)
-quality = QualityService(repository, live_analytics)
+quality = QualityService(repository)
 realtime: Optional[RealtimeService] = None
 
 

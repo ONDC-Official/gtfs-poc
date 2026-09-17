@@ -279,6 +279,19 @@ class SqliteRepository(Repository):
             "SELECT " + _VEHICLE_COLS + " FROM rt_vehicle_position "
             "WHERE " + " AND ".join(clauses) + " ORDER BY ts", params))
 
+    def vehicles_in_window(self, since_ts: int, until_ts: int) -> List[Dict[str, Any]]:
+        # Not partitioned like the Postgres table and (vehicle_id, ts) is
+        # already the primary key, so a plain window function needs no extra
+        # index here - this is the dev/test backend, not the one this feature
+        # is optimized for.
+        c = db.get_connection()
+        return _rows(c.execute(
+            "SELECT " + _VEHICLE_COLS + " FROM ("
+            "  SELECT *, ROW_NUMBER() OVER ("
+            "    PARTITION BY vehicle_id ORDER BY ts DESC) AS rn "
+            "  FROM rt_vehicle_position WHERE ts BETWEEN ? AND ?"
+            ") WHERE rn = 1", (since_ts, until_ts)))
+
     def log_poll(self, **kw: Any) -> None:
         c = db.get_connection()
         c.execute(

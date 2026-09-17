@@ -282,6 +282,17 @@ class PostgresRepository(Repository):
             "SELECT " + _VEHICLE_COLS + " FROM rt_vehicle_position "
             "WHERE " + " AND ".join(clauses) + " ORDER BY ts", params)
 
+    def vehicles_in_window(self, since_ts: int, until_ts: int) -> List[Dict[str, Any]]:
+        # DISTINCT ON, not a LAG()/PARTITION BY window function - served by
+        # ix_vp_vehicle_ts (vehicle_id, ts DESC) per partition, same "plain
+        # aggregate, not a window function over the whole range" rule that
+        # keeps continuity_report() off the 504 this table caused before.
+        return self._all(
+            "SELECT DISTINCT ON (vehicle_id) " + _VEHICLE_COLS + " "
+            "FROM rt_vehicle_position WHERE ts BETWEEN %(since)s AND %(until)s "
+            "ORDER BY vehicle_id, ts DESC",
+            {"since": since_ts, "until": until_ts})
+
     def log_poll(self, **kw: Any) -> None:
         with pg.pool().connection() as conn:
             conn.execute(

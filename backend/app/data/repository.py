@@ -71,6 +71,14 @@ class Repository(abc.ABC):
         window at the top; None means "up to the newest row"."""
 
     @abc.abstractmethod
+    def vehicles_in_window(self, since_ts: int, until_ts: int) -> List[Dict[str, Any]]:
+        """Each vehicle's most recent observation inside [since_ts, until_ts] -
+        the time-ranged equivalent of latest_vehicles(None, None, None). Used
+        by the quality tier so route coverage, freshness and correctness can
+        be recomputed for an arbitrary historical window instead of always
+        reading the very latest snapshot."""
+
+    @abc.abstractmethod
     def log_poll(self, **kwargs: Any) -> None: ...
 
     @abc.abstractmethod

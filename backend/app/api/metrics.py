@@ -38,11 +38,11 @@ def _gauge(name: str, doc: str, value: Optional[float],
 
 
 class QualityCollector:
-    def __init__(self):
-        pass
+    def __init__(self, minutes: Optional[float] = None):
+        self.minutes = minutes
 
     def collect(self) -> Iterable[GaugeMetricFamily]:
-        data = deps.quality.summary()
+        data = deps.quality.summary(minutes=self.minutes)
         yield from _quality_metrics(data)
 
 
@@ -218,7 +218,10 @@ def _quality_metrics(data: Dict[str, Any]) -> Iterable[GaugeMetricFamily]:
 
 
 @router.get("/metrics")
-def metrics() -> Response:
+def metrics(minutes: Optional[float] = None) -> Response:
+    """`minutes` applies one time-range to every layer (e.g.
+    ?minutes=60 in a Prometheus scrape_config's `params:`); omitted, this
+    keeps each layer's own default window, same as /api/quality/summary."""
     registry = CollectorRegistry()
-    registry.register(QualityCollector())
+    registry.register(QualityCollector(minutes=minutes))
     return Response(generate_latest(registry), media_type=CONTENT_TYPE_LATEST)

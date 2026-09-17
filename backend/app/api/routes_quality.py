@@ -1,4 +1,6 @@
 """Quality-tier endpoints: the 6-layer GTFS-realtime QA framework."""
+from typing import Optional
+
 from fastapi import APIRouter, Query
 
 from . import deps
@@ -37,7 +39,10 @@ def source_reliability(hours: float = Query(24, ge=1, le=168)):
 
 
 @router.get("/summary")
-def summary():
+def summary(force: bool = False,
+           minutes: Optional[float] = Query(None, ge=1, le=10080)):
     """Everything above, one composed payload - the same "single call for the
-    whole dashboard" shape as /api/analytics/live."""
-    return deps.quality.summary()
+    whole dashboard" shape as /api/analytics/live. `minutes` applies one
+    time-range to every layer at once (e.g. minutes=30/60/120); omit it to
+    keep each layer's own default window."""
+    return deps.quality.summary(force=force, minutes=minutes)

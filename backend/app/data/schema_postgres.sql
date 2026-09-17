@@ -134,6 +134,11 @@ CREATE INDEX IF NOT EXISTS ix_vp_ts       ON rt_vehicle_position(ts);
 CREATE INDEX IF NOT EXISTS ix_vp_route_ts ON rt_vehicle_position(route_id, ts);
 CREATE INDEX IF NOT EXISTS ix_vp_ingested ON rt_vehicle_position(ingested_at);
 CREATE INDEX IF NOT EXISTS ix_vp_geom     ON rt_vehicle_position USING GIST (geom);
+-- Serves vehicles_in_window()'s DISTINCT ON (vehicle_id) ... ORDER BY
+-- vehicle_id, ts DESC - the quality tier's time-ranged "latest position per
+-- vehicle in [since, until]" query. Declared on the partitioned parent, so
+-- Postgres propagates it to every existing and future day partition.
+CREATE INDEX IF NOT EXISTS ix_vp_vehicle_ts ON rt_vehicle_position(vehicle_id, ts DESC);
 
 -- Create the daily partition covering the given unix-second timestamp, if it
 -- does not already exist. Idempotent - a lost race just raises

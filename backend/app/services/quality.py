@@ -2,12 +2,19 @@
 Freshness & Latency, Continuity, Correctness, Field Richness, Source
 Reliability).
 
-Each layer reuses whatever the realtime/analytics tiers already compute
-(freshness buckets and route coverage from `LiveAnalytics`, poll stats from
-`rt_poll_log`) and adds only the handful of things nothing else derives yet -
-mainly the windowed gap analysis behind Continuity. One method per layer, plus
-`summary()` which composes a light version of all six for a single overview
-call, the same shape as `/api/analytics/live`.
+Every layer that measures the live fleet (route coverage, freshness,
+implausible speed, off-route/coordinate validity) is computed from
+`Repository.vehicles_in_window()` - each vehicle's most recent observation
+inside the layer's own time window - not from the single latest-ever
+snapshot. That means every layer, `summary()` included, can be recomputed
+for an arbitrary historical range (last 30 minutes, 1 hour, 2 hours, ...)
+straight from the database, not just "right now". The handful of exceptions
+that genuinely can't be windowed - schema stability (reflects only the
+latest poll batch), the static feed's own metadata, and the configured
+EXPECTED_FLEET_SIZE - are called out at their call sites below.
+
+One method per layer, plus `summary()` which composes a light version of all
+six for a single overview call, the same shape as `/api/analytics/live`.
 """
 import statistics
 import time
@@ -17,13 +24,29 @@ from ..config import settings
 from ..data.repository import Repository
 from .aggregator import GAP_THRESHOLD_S, GRID_LAT_DEG, GRID_LON_DEG
 from .geo import point_to_polyline_m
-from .live_analytics import STALE_S, LiveAnalytics
+from .live_analytics import IMPLAUSIBLE_MPS, STALE_S
 
 FRESH_THRESHOLDS_S = (30, 60, 120, 300)
 OFF_ROUTE_M = 50.0
 # Bound how many of the busiest live routes get an off-route-distance pass,
 # so a big fleet can't turn one dashboard call into hundreds of shape fetches.
 OFF_ROUTE_MAX_ROUTES = 150
+
+# summary() does real CPU-bound work across all six layers (the off-route
+# point-to-polyline loop especially), and Python's GIL means concurrent
+# callers don't parallelize that - they serialize behind each other's CPU
+# time. Prometheus scrapes /api/metrics every 30s and the frontend polls
+# /api/quality/summary every 60s; without a cache, any overlap between those
+# (plus a person just refreshing the page) turns into queued, increasingly
+# slow requests instead of independent fast ones. Same pattern as
+# LiveAnalytics.compute()'s cache, for the same reason.
+SUMMARY_CACHE_TTL_S = 15.0
+
+# summary()/metrics accept one unified `minutes` window applied to every
+# layer at once (see below); cap how many distinct windows stay cached
+# concurrently so an endpoint fed arbitrary query-param values can't grow
+# this dict without bound over a long-running process.
+MAX_CACHED_WINDOWS = 8
 
 
 def _pct(n: Optional[float], total: Optional[float]) -> Optional[float]:
@@ -33,9 +56,10 @@ def _pct(n: Optional[float], total: Optional[float]) -> Optional[float]:
 
 
 class QualityService:
-    def __init__(self, repo: Repository, live_analytics: LiveAnalytics):
+    def __init__(self, repo: Repository):
         self.repo = repo
-        self.live = live_analytics
+        self._summary_cache: Dict[Optional[float], Dict[str, Any]] = {}
+        self._summary_cache_at: Dict[Optional[float], float] = {}
 
     # ---- Layer 1: Coverage --------------------------------------------------
     def coverage(self, days: float = 3.0) -> Dict[str, Any]:
@@ -46,11 +70,16 @@ class QualityService:
         active = fleet_stats.get("active_vehicles") or 0
         expected = settings.expected_fleet_size
         route_count = self.repo.route_count()
-        # The full route-coverage count comes from LiveAnalytics's snapshot
-        # scan (it already tracks exactly which routes have a live vehicle);
-        # dark_routes() here is only for the weighted top-N list below, so its
-        # LIMIT must not be read back as the true dark-route count.
-        live_coverage = self.live.compute()["coverage"]
+        # Routes with >=1 vehicle reporting anywhere in [since_ts, now] - not
+        # just the current instant - so this reflects the same `days` window
+        # as spatial/temporal coverage below, not "right now".
+        window_rows = self.repo.vehicles_in_window(since_ts, int(now))
+        routes_live = len({r["route_id"] for r in window_rows if r.get("route_id")})
+        routes_dark = max(0, route_count - routes_live)
+        # dark_route_load's ranked top-N list still reflects the current
+        # snapshot (dark_routes() queries rt_vehicle_latest) - a full
+        # windowed version would need a second heavier query for a display
+        # list that's secondary to the routes_live/routes_dark counts above.
         dark = self.repo.dark_routes(50)
 
         cells_observed = self.repo.distinct_grid_cells(since_ts)
@@ -77,10 +106,10 @@ class QualityService:
                 "pct": _pct(active, expected),
             },
             "route_coverage": {
-                "routes_scheduled": live_coverage["routes_scheduled"],
-                "routes_live": live_coverage["routes_live"],
-                "routes_dark": live_coverage["routes_dark"],
-                "pct_live": live_coverage["pct_live"],
+                "routes_scheduled": route_count,
+                "routes_live": routes_live,
+                "routes_dark": routes_dark,
+                "pct_live": _pct(routes_live, route_count),
             },
             "dark_route_load": dark,
             "spatial_coverage": {
@@ -93,7 +122,10 @@ class QualityService:
     # ---- Layer 2: Freshness & Latency ---------------------------------------
     def freshness(self, poll_window_s: int = 1800) -> Dict[str, Any]:
         now = time.time()
-        rows = self.repo.latest_vehicles(None, None, None)
+        # Each vehicle's most recent report inside the window, not the
+        # all-time latest - so "total" is the fleet actually active in this
+        # window, and age is relative to `now` from a report that fell in it.
+        rows = self.repo.vehicles_in_window(int(now - poll_window_s), int(now))
         total = len(rows)
 
         within = {s: 0 for s in FRESH_THRESHOLDS_S}
@@ -187,10 +219,13 @@ class QualityService:
     def correctness(self, hours: float = 1.0) -> Dict[str, Any]:
         now = time.time()
         since_ts = int(now - hours * 3600)
-        live = self.live.compute()
-        quality = live["quality"]
-        rows = self.repo.latest_vehicles(None, None, None)
+        # Each vehicle's most recent report inside [since_ts, now] - implausible
+        # speed, off-route distance and coordinate validity are all computed
+        # from this window, not from whatever the very latest snapshot is.
+        rows = self.repo.vehicles_in_window(since_ts, int(now))
         total = len(rows)
+        implausible = sum(
+            1 for r in rows if (r.get("speed") or 0) >= IMPLAUSIBLE_MPS)
 
         summary = self.repo.static_feed_meta()
         bbox = summary.get("bbox")
@@ -232,8 +267,8 @@ class QualityService:
 
         return {
             "generated_at": int(now),
-            "implausible_speed": quality["implausible_speed"],
-            "implausible_speed_pct": quality["implausible_pct"],
+            "implausible_speed": implausible,
+            "implausible_speed_pct": _pct(implausible, total),
             "off_route": {
                 "sampled": sampled, "within_50m": within_50m,
                 "pct_within_50m": _pct(within_50m, sampled),
@@ -331,13 +366,36 @@ class QualityService:
         }
 
     # ---- overview -------------------------------------------------------------
-    def summary(self) -> Dict[str, Any]:
-        coverage = self.coverage()
-        freshness = self.freshness()
-        continuity = self.continuity()
-        correctness = self.correctness()
-        field_richness = self.field_richness()
-        source_reliability = self.source_reliability()
+    def summary(self, force: bool = False, minutes: Optional[float] = None) -> Dict[str, Any]:
+        """`minutes`, when given, is one time-range applied to every layer at
+        once (coverage's `days`, freshness's `poll_window_s`, continuity's/
+        correctness's/field_richness's/source_reliability's `hours` - all
+        derived from the same window) so "last 30 minutes" or "last 2 hours"
+        means the same range everywhere in the response. None keeps each
+        layer's own existing default window, unchanged."""
+        now = time.time()
+        cached = self._summary_cache.get(minutes)
+        cached_at = self._summary_cache_at.get(minutes, 0.0)
+        if not force and cached is not None and now - cached_at < SUMMARY_CACHE_TTL_S:
+            return cached
+
+        if minutes is not None:
+            days = minutes / 1440.0
+            hours = minutes / 60.0
+            poll_window_s = max(1, int(minutes * 60))
+            coverage = self.coverage(days=days)
+            freshness = self.freshness(poll_window_s=poll_window_s)
+            continuity = self.continuity(hours=hours)
+            correctness = self.correctness(hours=hours)
+            field_richness = self.field_richness(hours=hours)
+            source_reliability = self.source_reliability(hours=hours)
+        else:
+            coverage = self.coverage()
+            freshness = self.freshness()
+            continuity = self.continuity()
+            correctness = self.correctness()
+            field_richness = self.field_richness()
+            source_reliability = self.source_reliability()
 
         # A simple, documented heuristic - not an authoritative index. Each
         # sub-score is already a 0-100 percentage; missing inputs (e.g. no
@@ -353,10 +411,18 @@ class QualityService:
         present = [s for s in sub_scores if s is not None]
         composite = round(sum(present) / len(present), 1) if present else None
 
-        return {
-            "generated_at": int(time.time()),
+        result = {
+            "generated_at": int(now),
+            "window_minutes": minutes,
             "composite_qos_score": composite,
             "coverage": coverage, "freshness": freshness, "continuity": continuity,
             "correctness": correctness, "field_richness": field_richness,
             "source_reliability": source_reliability,
         }
+        self._summary_cache[minutes] = result
+        self._summary_cache_at[minutes] = now
+        if len(self._summary_cache) > MAX_CACHED_WINDOWS:
+            oldest = min(self._summary_cache_at, key=self._summary_cache_at.get)
+            self._summary_cache.pop(oldest, None)
+            self._summary_cache_at.pop(oldest, None)
+        return result

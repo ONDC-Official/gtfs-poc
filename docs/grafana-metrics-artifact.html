@@ -1,0 +1,485 @@
+<title>GTFS Quality Metrics Reference</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+:root{
+  --bg:#faf9f6;
+  --surface:#ffffff;
+  --surface-2:#f1f0ec;
+  --ink:#20272a;
+  --ink-dim:#5b6669;
+  --border:#e2e0d8;
+  --accent:#256d72;
+  --accent-ink:#0d3a3d;
+  --accent-soft:#e4f0ef;
+  --warn:#9a5b12;
+  --warn-soft:#faefdd;
+  --warn-border:#e9cfa0;
+  --code-bg:#f4f2ea;
+  --shadow: 0 1px 2px rgba(30,40,42,0.06), 0 8px 24px -16px rgba(30,40,42,0.18);
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#14191a;
+    --surface:#1b2224;
+    --surface-2:#212a2c;
+    --ink:#e9ece9;
+    --ink-dim:#9aa6a6;
+    --border:#2c3638;
+    --accent:#5fb8ba;
+    --accent-ink:#bdeceb;
+    --accent-soft:#1f3536;
+    --warn:#e0a955;
+    --warn-soft:#3a2e18;
+    --warn-border:#5a4726;
+    --code-bg:#1f2628;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -16px rgba(0,0,0,0.5);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#14191a;
+  --surface:#1b2224;
+  --surface-2:#212a2c;
+  --ink:#e9ece9;
+  --ink-dim:#9aa6a6;
+  --border:#2c3638;
+  --accent:#5fb8ba;
+  --accent-ink:#bdeceb;
+  --accent-soft:#1f3536;
+  --warn:#e0a955;
+  --warn-soft:#3a2e18;
+  --warn-border:#5a4726;
+  --code-bg:#1f2628;
+  --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -16px rgba(0,0,0,0.5);
+}
+
+*{box-sizing:border-box;}
+body{
+  background:var(--bg);
+  color:var(--ink);
+  font-family:'IBM Plex Sans',system-ui,sans-serif;
+  margin:0;
+  padding-inline:20px;
+  padding-block:0 64px;
+}
+::selection{ background:var(--accent-soft); color:var(--accent-ink); }
+
+a{ color:var(--accent); }
+
+.mono{ font-family:'IBM Plex Mono',ui-monospace,monospace; }
+
+/* ---------- top identity strip ---------- */
+.masthead{
+  max-width:920px;
+  margin:0 auto;
+  padding-block:40px 28px;
+  border-bottom:1px solid var(--border);
+}
+.masthead .kicker{
+  font-family:'IBM Plex Mono',monospace;
+  font-size:0.72rem;
+  letter-spacing:0.14em;
+  text-transform:uppercase;
+  color:var(--accent);
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin-bottom:14px;
+}
+.masthead .kicker::before{
+  content:"";
+  width:8px;height:8px;border-radius:50%;
+  background:var(--accent);
+  box-shadow:0 0 0 3px var(--accent-soft);
+}
+.masthead h1{
+  font-size:clamp(1.7rem,4vw,2.5rem);
+  line-height:1.1;
+  margin:0 0 12px;
+  font-weight:700;
+  letter-spacing:-0.01em;
+  text-wrap:balance;
+}
+.masthead p{
+  color:var(--ink-dim);
+  font-size:1rem;
+  line-height:1.6;
+  max-width:62ch;
+  margin:0 0 20px;
+}
+.meta-row{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px 28px;
+  font-family:'IBM Plex Mono',monospace;
+  font-size:0.78rem;
+  color:var(--ink-dim);
+}
+.meta-row strong{ color:var(--ink); font-weight:600; }
+
+/* ---------- layout ---------- */
+.layout{
+  max-width:920px;
+  margin:0 auto;
+  display:grid;
+  grid-template-columns:200px minmax(0,1fr);
+  gap:40px;
+  padding-top:32px;
+}
+@media (max-width:760px){
+  .layout{ grid-template-columns:1fr; }
+  nav.toc{ position:static !important; order:2; }
+}
+
+nav.toc{
+  position:sticky;
+  top:20px;
+  align-self:start;
+  display:flex;
+  flex-direction:column;
+  gap:2px;
+  font-family:'IBM Plex Mono',monospace;
+  font-size:0.78rem;
+}
+nav.toc a{
+  color:var(--ink-dim);
+  text-decoration:none;
+  padding:7px 10px;
+  border-radius:6px;
+  border-left:2px solid transparent;
+  display:flex;
+  align-items:baseline;
+  gap:8px;
+}
+nav.toc a:hover{ background:var(--surface-2); color:var(--ink); }
+nav.toc a .n{ color:var(--accent); font-weight:600; }
+nav.toc a.composite .n{ visibility:hidden; width:0; }
+
+main{ min-width:0; }
+
+/* ---------- sections ---------- */
+section.layer{
+  margin-bottom:44px;
+  scroll-margin-top:20px;
+}
+.layer-head{
+  display:flex;
+  align-items:baseline;
+  gap:12px;
+  margin-bottom:6px;
+}
+.layer-num{
+  font-family:'IBM Plex Mono',monospace;
+  font-size:0.85rem;
+  font-weight:600;
+  color:var(--accent);
+  background:var(--accent-soft);
+  padding:2px 8px;
+  border-radius:5px;
+}
+.layer-head h2{
+  font-size:1.28rem;
+  margin:0;
+  font-weight:700;
+  letter-spacing:-0.005em;
+}
+.layer-sub{
+  color:var(--ink-dim);
+  font-size:0.88rem;
+  margin:0 0 16px;
+  line-height:1.55;
+}
+
+.composite-card{
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:12px;
+  box-shadow:var(--shadow);
+  padding:22px 24px;
+  margin-bottom:44px;
+  display:flex;
+  gap:20px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+.composite-card .label{
+  font-family:'IBM Plex Mono',monospace;
+  font-size:0.75rem;
+  letter-spacing:0.08em;
+  text-transform:uppercase;
+  color:var(--accent);
+}
+.composite-card .metric-name{
+  font-family:'IBM Plex Mono',monospace;
+  font-weight:600;
+  font-size:0.98rem;
+  color:var(--ink);
+}
+.composite-card .formula{
+  color:var(--ink-dim);
+  font-size:0.92rem;
+  line-height:1.6;
+  flex:1 1 320px;
+  min-width:0;
+}
+.composite-card .formula code{ color:var(--ink); }
+
+/* ---------- metric table (card list, not a real table, for wrap control) ---------- */
+.metric-list{
+  border:1px solid var(--border);
+  border-radius:12px;
+  overflow:hidden;
+  background:var(--surface);
+  box-shadow:var(--shadow);
+}
+.metric-row{
+  display:grid;
+  grid-template-columns:minmax(220px,1fr) minmax(0,1.7fr);
+  gap:0;
+  border-bottom:1px solid var(--border);
+}
+.metric-row:last-child{ border-bottom:none; }
+.metric-row > div{ padding:13px 18px; }
+@media (max-width:640px){
+  .metric-row{ grid-template-columns:1fr; }
+  .metric-row .mcell:first-child{ padding-bottom:4px; border-bottom:1px dashed var(--border); }
+}
+.metric-row .mcell:first-child{
+  background:var(--surface-2);
+  font-family:'IBM Plex Mono',monospace;
+  font-size:0.82rem;
+  font-weight:600;
+  color:var(--ink);
+  word-break:break-word;
+  display:flex;
+  align-items:center;
+}
+.metric-row .mcell:last-child{
+  font-size:0.9rem;
+  line-height:1.55;
+  color:var(--ink-dim);
+  display:flex;
+  align-items:center;
+}
+.metric-row .mcell:last-child code{
+  font-family:'IBM Plex Mono',monospace;
+  font-size:0.84em;
+  background:var(--code-bg);
+  color:var(--accent-ink);
+  padding:0.1em 0.4em;
+  border-radius:4px;
+}
+.metric-row .label{
+  display:inline-block;
+  font-family:'IBM Plex Mono',monospace;
+  font-size:0.68rem;
+  letter-spacing:0.04em;
+  color:var(--accent);
+  background:var(--accent-soft);
+  border-radius:4px;
+  padding:1px 5px;
+  margin-left:8px;
+  vertical-align:middle;
+}
+
+/* ---------- callout ---------- */
+.callout{
+  background:var(--warn-soft);
+  border:1px solid var(--warn-border);
+  border-radius:12px;
+  padding:22px 24px;
+  margin-top:8px;
+}
+.callout h3{
+  margin:0 0 8px;
+  font-size:1.02rem;
+  color:var(--warn);
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+.callout h3::before{ content:"⚠"; font-size:0.95em; }
+.callout p{ margin:0 0 12px; color:var(--ink); font-size:0.92rem; line-height:1.6; }
+.callout ul{ margin:0; padding-left:20px; color:var(--ink); font-size:0.88rem; line-height:1.75; }
+.callout code{
+  font-family:'IBM Plex Mono',monospace;
+  background:var(--surface);
+  border:1px solid var(--warn-border);
+  padding:0.05em 0.4em;
+  border-radius:4px;
+  font-size:0.86em;
+}
+
+footer{
+  max-width:920px;
+  margin:56px auto 0;
+  padding-top:22px;
+  border-top:1px solid var(--border);
+  color:var(--ink-dim);
+  font-family:'IBM Plex Mono',monospace;
+  font-size:0.76rem;
+  display:flex;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:8px;
+}
+
+@media (prefers-reduced-motion:no-preference){
+  section.layer{ animation:rise 0.4s ease-out both; }
+  section.layer:nth-of-type(1){ animation-delay:0.02s; }
+  section.layer:nth-of-type(2){ animation-delay:0.05s; }
+  section.layer:nth-of-type(3){ animation-delay:0.08s; }
+  section.layer:nth-of-type(4){ animation-delay:0.11s; }
+  section.layer:nth-of-type(5){ animation-delay:0.14s; }
+  section.layer:nth-of-type(6){ animation-delay:0.17s; }
+  @keyframes rise{ from{ opacity:0; transform:translateY(6px);} to{opacity:1; transform:none;} }
+}
+</style>
+
+<div class="masthead">
+  <div class="kicker">Delhi Bus Network · Quality Tier</div>
+  <h1>GTFS Quality Metrics Reference</h1>
+  <p>Every metric exposed at <code class="mono">GET /api/metrics</code> and rendered on the Grafana dashboard — grouped by the six quality layers, with the exact formula behind each one.</p>
+  <div class="meta-row">
+    <span><strong>Prefix</strong> gtfs_quality_*</span>
+    <span><strong>Scrape interval</strong> 30s</span>
+    <span><strong>Server cache</strong> 15s TTL</span>
+    <span><strong>Source</strong> metrics.py + quality.py</span>
+  </div>
+</div>
+
+<div class="layout">
+  <nav class="toc">
+    <a href="#composite" class="composite">Composite score</a>
+    <a href="#coverage"><span class="n">01</span> Coverage</a>
+    <a href="#freshness"><span class="n">02</span> Freshness &amp; Latency</a>
+    <a href="#continuity"><span class="n">03</span> Continuity</a>
+    <a href="#correctness"><span class="n">04</span> Correctness</a>
+    <a href="#field-richness"><span class="n">05</span> Field Richness</a>
+    <a href="#source-reliability"><span class="n">06</span> Source Reliability</a>
+    <a href="#not-time-ranged">Live-snapshot caveats</a>
+  </nav>
+
+  <main>
+    <div class="composite-card" id="composite">
+      <div>
+        <div class="label">Headline</div>
+        <div class="metric-name">gtfs_quality_composite_score</div>
+      </div>
+      <div class="formula">Unweighted mean of 5 sub-scores (each already 0–100), skipping any that are <code>null</code>: <code>route_coverage.pct_live</code>, <code>freshness.fresh_within_s["60"].pct</code>, <code>continuity.report_continuity_pct</code>, <code>100 − correctness.implausible_speed_pct</code>, <code>source_reliability.poll_success_rate.pct</code>.</div>
+    </div>
+
+    <section class="layer" id="coverage">
+      <div class="layer-head"><span class="layer-num">01</span><h2>Coverage</h2></div>
+      <p class="layer-sub">Window: <code class="mono">days</code> (default 3) for spatial/temporal sub-metrics. Fleet and route coverage reflect the current live snapshot.</p>
+      <div class="metric-list">
+        <div class="metric-row"><div class="mcell">gtfs_quality_fleet_coverage_pct</div><div class="mcell"><code>active_vehicles / EXPECTED_FLEET_SIZE × 100</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_fleet_active_vehicles</div><div class="mcell">Vehicles with a position update within the "active" staleness window (<code>STALE_S</code>)</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_fleet_expected_vehicles</div><div class="mcell">Configured <code>EXPECTED_FLEET_SIZE</code> — currently 5500, illustrative; no confirmed real DTC fleet figure</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_route_coverage_pct<span class="label">live</span></div><div class="mcell"><code>routes_live / routes_scheduled × 100</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_routes_scheduled</div><div class="mcell">Distinct <code>route_id</code> count in the static GTFS schedule</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_routes_live<span class="label">live</span></div><div class="mcell">Scheduled routes with ≥1 vehicle in the current live snapshot</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_routes_dark<span class="label">live</span></div><div class="mcell"><code>routes_scheduled − routes_live</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_dark_route_top_trip_count</div><div class="mcell">Scheduled trip count of the single busiest dark route (top of the ranked list, not a total)</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_spatial_coverage_pct</div><div class="mcell"><code>cells_observed / cells_total × 100</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_spatial_cells_observed</div><div class="mcell">Distinct 250m×250m grid cells with ≥1 vehicle observation in the last <code>days</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_spatial_cells_total</div><div class="mcell"><code>(bbox_lat_span / 250m) × (bbox_lon_span / 250m)</code>, from the static feed's bounding box</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_temporal_coverage_pct</div><div class="mcell">Per (<code>hour</code>, <code>weekend</code>) label pair: <code>avg_routes_live_in_slot / routes_scheduled × 100</code>, averaged over the last <code>days</code></div></div>
+      </div>
+    </section>
+
+    <section class="layer" id="freshness">
+      <div class="layer-head"><span class="layer-num">02</span><h2>Freshness &amp; Latency</h2></div>
+      <p class="layer-sub">Vehicle-freshness metrics are relative to <em>now</em>. Feed-latency metrics use <code class="mono">poll_window_s</code> (default 1800s).</p>
+      <div class="metric-list">
+        <div class="metric-row"><div class="mcell">gtfs_quality_fresh_within_pct<span class="label">live</span></div><div class="mcell">Per <code>threshold_s</code> label (30/60/120/300): <code>vehicles with (now − last_report_ts) ≤ threshold_s / total_vehicles × 100</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_staleness_bucket_count<span class="label">live</span></div><div class="mcell">Vehicle count bucketed by <code>now − last_report_ts</code>: 0–60s, 60–180s, 180–300s, 300–600s, 600s+</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_feed_age_at_source_seconds</div><div class="mcell"><code>mean(poll.polled_at − poll.feed_timestamp)</code> over successful polls in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_native_publish_cadence_seconds</div><div class="mcell"><code>mean(gap between successive distinct feed_timestamp values)</code> in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_ingest_latency_ms</div><div class="mcell"><code>mean(poll.latency_ms)</code> — our own fetch+parse time — over successful polls in the window</div></div>
+      </div>
+    </section>
+
+    <section class="layer" id="continuity">
+      <div class="layer-head"><span class="layer-num">03</span><h2>Continuity</h2></div>
+      <p class="layer-sub">Window: <code class="mono">hours</code> (default 3), fed by the <code class="mono">analytics_continuity_hour</code> / <code class="mono">analytics_vehicle_gap_state</code> / <code class="mono">analytics_trip_gap_state</code> rollup tables.</p>
+      <div class="metric-list">
+        <div class="metric-row"><div class="mcell">gtfs_quality_report_continuity_pct</div><div class="mcell"><code>min(100, avg_observations_per_vehicle / expected_slots × 100)</code>, where <code>expected_slots = (avg_span_s / rt_poll_seconds) + 1</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_vehicles_in_window</div><div class="mcell">Distinct vehicles observed in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_gaps_over_threshold</div><div class="mcell">Count of reporting gaps <code>&gt; GAP_THRESHOLD_S</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_gap_pct_of_gaps</div><div class="mcell"><code>gaps_over_threshold / gaps_total × 100</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_gap_duration_bucket_count</div><div class="mcell">Gap count bucketed by duration (bucket boundaries from the rollup)</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_trip_completeness_pct</div><div class="mcell"><code>complete_trips / total_trips × 100</code> — a trip is "complete" if it has no internal gap over <code>GAP_THRESHOLD_S</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_trips_total</div><div class="mcell">Distinct (<code>vehicle_id</code>, <code>trip_id</code>) pairs observed in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_trips_complete</div><div class="mcell">Trips with no gap over the threshold</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_session_churn</div><div class="mcell">Same count as <code>gaps_over_threshold</code> — every gap over threshold is by definition a stale→recovered cycle</div></div>
+      </div>
+    </section>
+
+    <section class="layer" id="correctness">
+      <div class="layer-head"><span class="layer-num">04</span><h2>Correctness</h2></div>
+      <p class="layer-sub"><code class="mono">implausible_speed*</code>, <code class="mono">off_route</code> and <code class="mono">coordinate_validity</code> reflect the current live snapshot. <code class="mono">referential_integrity</code> and <code class="mono">duplicate_snapshot_rate</code> use <code class="mono">hours</code> (default 1) against the DB.</p>
+      <div class="metric-list">
+        <div class="metric-row"><div class="mcell">gtfs_quality_implausible_speed_pct<span class="label">live</span></div><div class="mcell"><code>vehicles with speed ≥ IMPLAUSIBLE_MPS / total_vehicles × 100</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_implausible_speed_count<span class="label">live</span></div><div class="mcell">Count, same basis as the pct above</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_off_route_pct_within_50m<span class="label">live</span></div><div class="mcell"><code>vehicles within 50m of route shape / sampled_vehicles × 100</code>, sampled over the busiest ≤150 live routes (<code>OFF_ROUTE_MAX_ROUTES</code>)</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_off_route_avg_distance_m<span class="label">live</span></div><div class="mcell"><code>mean(point_to_polyline_distance_m)</code> over sampled vehicles</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_off_route_routes_sampled<span class="label">live</span></div><div class="mcell">Number of routes included in the off-route pass (capped at 150)</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_coordinate_out_of_bounds<span class="label">live</span></div><div class="mcell">Live positions outside the static feed's bounding box</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_coordinate_zero<span class="label">live</span></div><div class="mcell">Live positions at exactly (0, 0)</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_referential_invalid_route_id</div><div class="mcell">Live <code>route_id</code> values absent from the static schedule, in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_referential_invalid_trip_id</div><div class="mcell">Live <code>trip_id</code> values absent from the static schedule, in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_duplicate_snapshot_pct</div><div class="mcell"><code>polls where new_rows == 0 / total_ok_polls × 100</code>, in the window</div></div>
+      </div>
+    </section>
+
+    <section class="layer" id="field-richness">
+      <div class="layer-head"><span class="layer-num">05</span><h2>Field Richness</h2></div>
+      <p class="layer-sub">Window: <code class="mono">hours</code> (default 1).</p>
+      <div class="metric-list">
+        <div class="metric-row"><div class="mcell">gtfs_quality_field_population_pct</div><div class="mcell">Per <code>field</code> label: <code>records with that optional field populated / total_records × 100</code>, over recent records in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_static_feed_age_days</div><div class="mcell"><code>(now − static_loaded_at) / 86400</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_static_routes</div><div class="mcell">Routes in the loaded static schedule</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_static_stops</div><div class="mcell">Stops in the loaded static schedule</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_static_trips</div><div class="mcell">Trips in the loaded static schedule</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_static_shape_points</div><div class="mcell">Shape points in the loaded static schedule</div></div>
+      </div>
+    </section>
+
+    <section class="layer" id="source-reliability">
+      <div class="layer-head"><span class="layer-num">06</span><h2>Source Reliability</h2></div>
+      <p class="layer-sub">Window: <code class="mono">hours</code> (default 24) — fully DB/time-range based, from <code class="mono">rt_poll_log</code>.</p>
+      <div class="metric-list">
+        <div class="metric-row"><div class="mcell">gtfs_quality_poll_success_pct</div><div class="mcell"><code>successful_polls / total_polls × 100</code>, in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_error_breakdown_count</div><div class="mcell">Per <code>kind</code> label (timeout, 5xx, 4xx, empty_body, other): count of failed polls of that kind</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_feed_volume_mean</div><div class="mcell"><code>mean(entity_count)</code> over successful polls in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_feed_volume_stdev</div><div class="mcell">Population stdev of <code>entity_count</code> over successful polls</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_feed_volume_min</div><div class="mcell"><code>min(entity_count)</code> over successful polls in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_feed_volume_max</div><div class="mcell"><code>max(entity_count)</code> over successful polls in the window</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_feed_volume_unstable</div><div class="mcell"><code>1</code> if the minimum poll's <code>entity_count</code> was under half the window's mean, else <code>0</code></div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_schema_fields_count</div><div class="mcell">Count of distinct non-null fields seen in the latest poll batch</div></div>
+        <div class="metric-row"><div class="mcell">gtfs_quality_schema_last_changed_timestamp</div><div class="mcell">Unix seconds the feed's field set last changed</div></div>
+      </div>
+    </section>
+
+    <section class="layer" id="not-time-ranged">
+      <div class="layer-head"><h2>Live-snapshot caveats</h2></div>
+      <div class="callout">
+        <h3>Not time-range-scoped</h3>
+        <p>The metrics tagged <span class="label" style="margin-left:0;">live</span> above reflect the <strong>current</strong> live snapshot regardless of any window parameter, rather than a historical query over an arbitrary time range:</p>
+        <ul>
+          <li><code>gtfs_quality_route_coverage_pct</code> / <code>routes_live</code> / <code>routes_dark</code> — sourced from the in-memory <code>LiveAnalytics</code> poll, not the DB</li>
+          <li><code>gtfs_quality_fresh_within_pct</code> / <code>staleness_bucket_count</code> — inherently "as of now" by definition (freshness is always relative to the present)</li>
+          <li><code>gtfs_quality_implausible_speed_pct</code> / <code>_count</code> — sourced from <code>LiveAnalytics</code>, not the DB</li>
+          <li><code>gtfs_quality_off_route_*</code> / <code>coordinate_out_of_bounds</code> / <code>coordinate_zero</code> — sourced from the DB's "latest position per vehicle" snapshot, not a time-ranged query</li>
+        </ul>
+        <p style="margin-top:12px;">Everything else in this reference is computed from the database over the stated window and can, in principle, be recomputed for any historical time range.</p>
+      </div>
+    </section>
+  </main>
+</div>
+
+<footer>
+  <span>backend/app/api/metrics.py · backend/app/services/quality.py</span>
+  <span>docs/grafana-metrics.md</span>
+</footer>
