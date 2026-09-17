@@ -74,8 +74,24 @@ class PostgresRepository(Repository):
 
     def feed_summary(self) -> Dict[str, Any]:
         out = self.static_feed_meta()
+        # An exact COUNT(*) here is a full scan across every day-partition -
+        # caught live taking 47s+ and holding a pool connection the whole
+        # time, which is what actually caused the PoolTimeout/504s (not the
+        # vehicles_in_window() queries below, which run in well under a
+        # second). This is a display figure, not used in any calculation, so
+        # the planner's row-count estimate (summed over the partitions, since
+        # the parent's own reltuples isn't reliably kept in sync) is a fast,
+        # good-enough stand-in.
         out["history_rows"] = self._one(
-            "SELECT COUNT(*) AS n FROM rt_vehicle_position")["n"]
+            # reltuples is -1 (or, summed across an empty/never-analyzed set
+            # of partitions, a small negative number) before the first
+            # autovacuum ANALYZE - clamp to 0 rather than show a nonsensical
+            # negative row count on a freshly created deployment.
+            "SELECT GREATEST(COALESCE(SUM(c.reltuples), 0)::bigint, 0) AS n "
+            "FROM pg_inherits i "
+            "JOIN pg_class c ON c.oid = i.inhrelid "
+            "JOIN pg_class parent ON parent.oid = i.inhparent "
+            "WHERE parent.relname = 'rt_vehicle_position'")["n"]
         return out
 
     def list_routes(self, q: Optional[str], limit: int, offset: int) -> Dict[str, Any]:
