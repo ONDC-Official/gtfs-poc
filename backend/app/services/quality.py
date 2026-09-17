@@ -70,10 +70,16 @@ class QualityService:
         active = fleet_stats.get("active_vehicles") or 0
         expected = settings.expected_fleet_size
         route_count = self.repo.route_count()
-        # Routes with >=1 vehicle reporting anywhere in [since_ts, now] - not
-        # just the current instant - so this reflects the same `days` window
-        # as spatial/temporal coverage below, not "right now".
-        window_rows = self.repo.vehicles_in_window(since_ts, int(now))
+        # Deliberately STALE_S (a few minutes), not `days` - "live" means
+        # reporting recently, the same recency `fleet_stats` above uses for
+        # "active". Scanning the full `days` window here (up to years, since
+        # `days` is meant for the spatial/temporal metrics below) turned a
+        # cheap recency check into a scan of the table's entire retention
+        # window on every summary() call - caught live in production running
+        # 60s+ per call under concurrent load and starving the connection
+        # pool for everything else.
+        route_since_ts = int(now - STALE_S)
+        window_rows = self.repo.vehicles_in_window(route_since_ts, int(now))
         routes_live = len({r["route_id"] for r in window_rows if r.get("route_id")})
         routes_dark = max(0, route_count - routes_live)
         # dark_route_load's ranked top-N list still reflects the current
