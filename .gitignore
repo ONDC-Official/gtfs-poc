@@ -1,0 +1,21 @@
+# credentials - the RT feed key lives here
+gtfs-rt.cred
+backend/.env
+.env
+
+# GTFS static feed - 124 MB, of which stop_times.txt alone is 89 MB. Third
+# party data that is re-downloadable, so it is fetched rather than committed.
+delhi_buses_static_gtfs_v1-2/
+
+# data plane artifacts
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+frontend/dist/
+.DS_Store
+delhi_buses_static_gtfs_v1.zip

@@ -1,0 +1,12 @@
+# Scrapes the GTFS quality metrics exposed at /api/metrics on the api
+# container. metrics_path is explicit because Prometheus defaults to bare
+# /metrics, which is not where this is mounted (see backend/app/api/metrics.py
+# for why: /api/metrics rides the same nginx proxy rules as everything else).
+# 30s to match the realtime poller's own cadence (rt_poll_seconds) - no point
+# scraping faster than the numbers underneath can actually change.
+scrape_configs:
+  - job_name: gtfs-quality
+    scrape_interval: 30s
+    metrics_path: /api/metrics
+    static_configs:
+      - targets: ["api:8000"]

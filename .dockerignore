@@ -1,0 +1,11 @@
+.git/
+.venv/
+node_modules/
+data/
+frontend/dist/
+frontend/node_modules/
+**/__pycache__/
+**/*.pyc
+gtfs-rt.cred
+backend/.env
+.DS_Store
