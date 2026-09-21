@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 
 from ..data.repository import Repository
 from .geo import haversine_m as _haversine_m
+from .singleflight import SingleFlightCache
 
 MPS_TO_KMH = 3.6
 
@@ -42,20 +43,18 @@ def _percentile(values: List[float], p: float) -> Optional[float]:
 
 class LiveAnalytics:
     """Computes the whole RT dashboard from one snapshot, with a short cache so
-    several panels refreshing at once do not each re-scan the fleet."""
+    several panels refreshing at once do not each re-scan the fleet - and a
+    single-flight lock so several panels refreshing at the *same instant*
+    (several open tabs, right after a cache expiry or a restart) share one
+    computation instead of each starting their own."""
 
     def __init__(self, repo: Repository):
         self.repo = repo
-        self._cache: Optional[Dict[str, Any]] = None
-        self._cache_at = 0.0
+        self._cache = SingleFlightCache(ttl_s=CACHE_TTL_S)
 
     def compute(self, force: bool = False) -> Dict[str, Any]:
-        now = time.time()
-        if not force and self._cache and now - self._cache_at < CACHE_TTL_S:
-            return self._cache
-        result = self._compute(now)
-        self._cache, self._cache_at = result, now
-        return result
+        return self._cache.get_or_compute(
+            "live", lambda: self._compute(time.time()), force=force)
 
     # -----------------------------------------------------------------------
     def _compute(self, now: float) -> Dict[str, Any]:

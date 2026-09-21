@@ -5,9 +5,10 @@ Postgres/DuckDB this is the layer that grows (headway adherence, dwell
 detection, corridor speed profiles) without the API contract changing.
 """
 import time
-from typing import Any, Callable, Dict, List
+from typing import Any, Dict, List
 
 from ..data.repository import Repository
+from .singleflight import SingleFlightCache
 
 MPS_TO_KMH = 3.6
 
@@ -23,17 +24,15 @@ CACHE_TTL_S = 10.0
 class AnalyticsService:
     def __init__(self, repo: Repository):
         self.repo = repo
-        self._cache: Dict[str, Any] = {}
-        self._cache_at: Dict[str, float] = {}
+        # SingleFlightCache, not a plain dict: several tabs polling the same
+        # endpoint at the exact instant a key is cold (a restart, or a TTL
+        # expiry) share one computation instead of each re-scanning the raw
+        # observation log - see singleflight.py's docstring for why that
+        # distinction matters here.
+        self._cache = SingleFlightCache(ttl_s=CACHE_TTL_S)
 
-    def _cached(self, key: str, compute: Callable[[], Any]) -> Any:
-        now = time.time()
-        if key in self._cache and now - self._cache_at.get(key, 0.0) < CACHE_TTL_S:
-            return self._cache[key]
-        value = compute()
-        self._cache[key] = value
-        self._cache_at[key] = now
-        return value
+    def _cached(self, key: str, compute) -> Any:
+        return self._cache.get_or_compute(key, compute)
 
     def overview(self, window_s: int = 300) -> Dict[str, Any]:
         def compute():

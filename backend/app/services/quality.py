@@ -25,6 +25,7 @@ from ..data.repository import Repository
 from .aggregator import GAP_THRESHOLD_S, GRID_LAT_DEG, GRID_LON_DEG
 from .geo import point_to_polyline_m
 from .live_analytics import IMPLAUSIBLE_MPS, STALE_S
+from .singleflight import SingleFlightCache
 
 FRESH_THRESHOLDS_S = (30, 60, 120, 300)
 OFF_ROUTE_M = 50.0
@@ -58,8 +59,17 @@ def _pct(n: Optional[float], total: Optional[float]) -> Optional[float]:
 class QualityService:
     def __init__(self, repo: Repository):
         self.repo = repo
-        self._summary_cache: Dict[Optional[float], Dict[str, Any]] = {}
-        self._summary_cache_at: Dict[Optional[float], float] = {}
+        # SingleFlightCache, not a plain dict: the comment on
+        # SUMMARY_CACHE_TTL_S above already called out that Prometheus,
+        # the frontend poll and a person refreshing the page can overlap -
+        # but a plain "check cache, else compute" cache only dedupes calls
+        # that land *sequentially*. Several of those landing at the same
+        # instant a key is cold (a restart, or the moment the 15s TTL
+        # expires) each still ran the full six-layer computation
+        # independently - caught live via duplicate concurrent
+        # gtfs_stop_times counts in pg_stat_activity. See singleflight.py.
+        self._summary_cache = SingleFlightCache(
+            ttl_s=SUMMARY_CACHE_TTL_S, max_keys=MAX_CACHED_WINDOWS)
 
     # ---- Layer 1: Coverage --------------------------------------------------
     def coverage(self, days: float = 3.0) -> Dict[str, Any]:
@@ -379,56 +389,46 @@ class QualityService:
         derived from the same window) so "last 30 minutes" or "last 2 hours"
         means the same range everywhere in the response. None keeps each
         layer's own existing default window, unchanged."""
-        now = time.time()
-        cached = self._summary_cache.get(minutes)
-        cached_at = self._summary_cache_at.get(minutes, 0.0)
-        if not force and cached is not None and now - cached_at < SUMMARY_CACHE_TTL_S:
-            return cached
+        def compute() -> Dict[str, Any]:
+            now = time.time()
+            if minutes is not None:
+                days = minutes / 1440.0
+                hours = minutes / 60.0
+                poll_window_s = max(1, int(minutes * 60))
+                coverage = self.coverage(days=days)
+                freshness = self.freshness(poll_window_s=poll_window_s)
+                continuity = self.continuity(hours=hours)
+                correctness = self.correctness(hours=hours)
+                field_richness = self.field_richness(hours=hours)
+                source_reliability = self.source_reliability(hours=hours)
+            else:
+                coverage = self.coverage()
+                freshness = self.freshness()
+                continuity = self.continuity()
+                correctness = self.correctness()
+                field_richness = self.field_richness()
+                source_reliability = self.source_reliability()
 
-        if minutes is not None:
-            days = minutes / 1440.0
-            hours = minutes / 60.0
-            poll_window_s = max(1, int(minutes * 60))
-            coverage = self.coverage(days=days)
-            freshness = self.freshness(poll_window_s=poll_window_s)
-            continuity = self.continuity(hours=hours)
-            correctness = self.correctness(hours=hours)
-            field_richness = self.field_richness(hours=hours)
-            source_reliability = self.source_reliability(hours=hours)
-        else:
-            coverage = self.coverage()
-            freshness = self.freshness()
-            continuity = self.continuity()
-            correctness = self.correctness()
-            field_richness = self.field_richness()
-            source_reliability = self.source_reliability()
+            # A simple, documented heuristic - not an authoritative index.
+            # Each sub-score is already a 0-100 percentage; missing inputs
+            # (e.g. no EXPECTED_FLEET_SIZE configured) are left out of the
+            # average rather than counted as failures.
+            sub_scores = [
+                coverage["route_coverage"]["pct_live"],
+                freshness["fresh_within_s"]["60"]["pct"],
+                continuity["report_continuity_pct"],
+                100 - (correctness["implausible_speed_pct"] or 0),
+                source_reliability["poll_success_rate"]["pct"],
+            ]
+            present = [s for s in sub_scores if s is not None]
+            composite = round(sum(present) / len(present), 1) if present else None
 
-        # A simple, documented heuristic - not an authoritative index. Each
-        # sub-score is already a 0-100 percentage; missing inputs (e.g. no
-        # EXPECTED_FLEET_SIZE configured) are left out of the average rather
-        # than counted as failures.
-        sub_scores = [
-            coverage["route_coverage"]["pct_live"],
-            freshness["fresh_within_s"]["60"]["pct"],
-            continuity["report_continuity_pct"],
-            100 - (correctness["implausible_speed_pct"] or 0),
-            source_reliability["poll_success_rate"]["pct"],
-        ]
-        present = [s for s in sub_scores if s is not None]
-        composite = round(sum(present) / len(present), 1) if present else None
-
-        result = {
-            "generated_at": int(now),
-            "window_minutes": minutes,
-            "composite_qos_score": composite,
-            "coverage": coverage, "freshness": freshness, "continuity": continuity,
-            "correctness": correctness, "field_richness": field_richness,
-            "source_reliability": source_reliability,
-        }
-        self._summary_cache[minutes] = result
-        self._summary_cache_at[minutes] = now
-        if len(self._summary_cache) > MAX_CACHED_WINDOWS:
-            oldest = min(self._summary_cache_at, key=self._summary_cache_at.get)
-            self._summary_cache.pop(oldest, None)
-            self._summary_cache_at.pop(oldest, None)
-        return result
+            return {
+                "generated_at": int(now),
+                "window_minutes": minutes,
+                "composite_qos_score": composite,
+                "coverage": coverage, "freshness": freshness, "continuity": continuity,
+                "correctness": correctness, "field_richness": field_richness,
+                "source_reliability": source_reliability,
+            }
+        return self._summary_cache.get_or_compute(str(minutes), compute, force=force)
