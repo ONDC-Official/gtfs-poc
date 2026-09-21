@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     # history moves to a columnar store.
     history_retention_hours: int = 12
 
+    # ---- analytics rollup ---------------------------------------------
+    # How often the aggregator re-folds raw observations into the analytics
+    # rollup tables. Runs cheap in dev; on the growing production dataset
+    # each pass is a full GROUP BY over ~1h of rows, so keep this coarse and
+    # let operators force an out-of-band pass via POST /api/analytics/aggregator/run
+    # when they need fresher numbers immediately.
+    aggregator_interval_s: int = 6 * 3600
+
     # ---- service ----------------------------------------------------------
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 

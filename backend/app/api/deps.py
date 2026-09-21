@@ -28,7 +28,7 @@ repository: Repository = _load_repository()
 analytics = AnalyticsService(repository)
 live_analytics = LiveAnalytics(repository)
 spatial = SpatialAnalytics(repository)
-aggregator = Aggregator(repository)
+aggregator = Aggregator(repository, interval_s=settings.aggregator_interval_s)
 quality = QualityService(repository)
 realtime: Optional[RealtimeService] = None
 

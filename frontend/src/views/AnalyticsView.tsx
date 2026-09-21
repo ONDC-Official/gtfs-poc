@@ -88,9 +88,17 @@ export function AnalyticsView() {
 
   const [grid, setGrid] = useState<GridResponse | null>(null)
   const [gridLoading, setGridLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
 
-  // The rollup only advances every couple of minutes, so polling faster than
-  // that just re-fetches identical cells.
+  // The backend rollup itself only runs once every few hours (see
+  // AGGREGATOR_INTERVAL_MS below) - the raw GROUP BY it does over the
+  // observation log is expensive, so recomputing it on a tight loop is what
+  // was pegging the DB's CPU. Polling on the same cadence just re-fetches
+  // identical rows in between; "refreshKey" is the only thing that forces an
+  // earlier read, and it only advances from the button below.
+  const AGGREGATOR_INTERVAL_MS = 6 * 3600_000
+  const [refreshKey, setRefreshKey] = useState(0)
+
   useEffect(() => {
     let alive = true
     setGridLoading(true)
@@ -98,13 +106,29 @@ export function AnalyticsView() {
       .then((g) => { if (alive) { setGrid(g); setGridLoading(false) } })
       .catch(() => { if (alive) setGridLoading(false) })
     load()
-    const id = setInterval(load, 120_000)
+    const id = setInterval(load, AGGREGATOR_INTERVAL_MS)
     return () => { alive = false; clearInterval(id) }
-  }, [hours, factor])
+  }, [hours, factor, refreshKey])
 
-  const hotspots = usePolled(() => api.hotspots(hours, 10), 120_000, [hours])
-  const hourly = usePolled(() => api.hourly(24), 120_000)
-  const agg = usePolled(() => api.aggregator(), 60_000)
+  const hotspots = usePolled(() => api.hotspots(hours, 10), AGGREGATOR_INTERVAL_MS, [hours, refreshKey])
+  const hourly = usePolled(() => api.hourly(24), AGGREGATOR_INTERVAL_MS, [refreshKey])
+  const agg = usePolled(() => api.aggregator(), AGGREGATOR_INTERVAL_MS, [refreshKey])
+
+  // Manual trigger: forces one rollup pass on the server right now, then
+  // re-reads everything above once it's done. This is the only thing (other
+  // than the server's own 6h timer) that recomputes the analytics tables.
+  const handleRefreshNow = async () => {
+    setRefreshing(true)
+    try {
+      await api.runAggregator(false)
+    } catch {
+      // Surfacing the rollup failure isn't critical here - the stale data
+      // just stays on screen and the user can try again.
+    } finally {
+      setRefreshing(false)
+      setRefreshKey((k) => k + 1)
+    }
+  }
 
   useEffect(() => {
     if (!routeId) { setCorridor(null); setRouteShape(null); setRouteMeta(null); return }
@@ -163,6 +187,17 @@ export function AnalyticsView() {
                   {totals.obs.toLocaleString()} observations</>
               : 'No rollup yet'}
         </div>
+        <button type="button" onClick={handleRefreshNow} disabled={refreshing}
+                title="Recompute the analytics rollup now. It also refreshes on its own every 6 hours."
+                style={{
+                  border: '1px solid var(--border)', borderRadius: 6,
+                  padding: '4px 10px', fontSize: 12, fontWeight: 500,
+                  background: refreshing ? 'var(--surface-2)' : 'var(--surface-1)',
+                  color: 'var(--text-secondary)',
+                  cursor: refreshing ? 'default' : 'pointer',
+                }}>
+          {refreshing ? 'Refreshing…' : 'Refresh now'}
+        </button>
       </div>
 
       <div style={{

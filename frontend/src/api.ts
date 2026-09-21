@@ -17,6 +17,12 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
+async function post<T>(path: string): Promise<T> {
+  const res = await fetch(API_ROOT + path, { method: 'POST' })
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText} on ${path}`)
+  return res.json() as Promise<T>
+}
+
 export const api = {
   feed: () => get<FeedSummary>('/api/feed'),
   live: () => get<LiveAnalytics>('/api/analytics/live'),
@@ -48,6 +54,8 @@ export const api = {
     get<CorridorResponse>(
       `/api/analytics/corridor/${encodeURIComponent(routeId)}?hours=${hours}`),
   aggregator: () => get<AggregatorStatus>('/api/analytics/aggregator'),
+  runAggregator: (full = false) =>
+    post<AggregatorStatus>(`/api/analytics/aggregator/run?full=${full}`),
   vehicleHistory: (id: string, minutes = 60) =>
     get<{ geometry: GeoJSON.LineString; count: number }>(
       `/api/realtime/vehicles/${encodeURIComponent(id)}/history?minutes=${minutes}`),
