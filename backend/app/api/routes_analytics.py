@@ -100,3 +100,16 @@ async def aggregator_run(full: bool = False):
     result = await asyncio.to_thread(deps.aggregator.run_once, full)
     deps.aggregator.last_run = result
     return result
+
+
+@router.get("/trip-match")
+def trip_match(trip_id: str):
+    """The stored match between one live trip_id and the static timetable -
+    see live_trip_match's schema comment for why this is a derived lookup
+    rather than the raw trip_id itself meaning anything against gtfs_trips.
+    404 means this trip_id hasn't been matched yet: either it hasn't reached
+    the aggregator's watermark yet, or it's outside the retention window."""
+    match = deps.repository.trip_match(trip_id)
+    if not match:
+        raise HTTPException(404, "no match recorded for this trip_id yet")
+    return match

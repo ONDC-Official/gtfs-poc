@@ -1,10 +1,11 @@
 """SQLite implementation of the data-plane port."""
 import math
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import db
 from .repository import Repository
+from ..services.singleflight import SingleFlightCache
 
 _VEHICLE_COLS = (
     "vehicle_id, ts, trip_id, route_id, lat, lon, bearing, speed, stop_id, "
@@ -17,33 +18,64 @@ _M_PER_DEG = 111_320.0
 # SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds; chunk well under it.
 _PARAM_CHUNK = 500
 
+# See postgres_repo.py's STATIC_DATA_TTL_S - same reasoning, kept here so the
+# two adapters' behaviour matches under the Repository contract suite.
+STATIC_DATA_TTL_S = 3600.0
+
 
 def _rows(cur) -> List[Dict[str, Any]]:
     return [dict(r) for r in cur.fetchall()]
 
 
 class SqliteRepository(Repository):
+    def __init__(self):
+        self._static_meta_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+        self._route_shape_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+        # See _refresh_static_watermark() below.
+        self._static_loaded_watermark: Optional[str] = None
+
+    def invalidate_static_cache(self) -> None:
+        """See PostgresRepository.invalidate_static_cache() - same purpose."""
+        self._static_meta_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+        self._route_shape_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+
+    def _refresh_static_watermark(self) -> None:
+        """See PostgresRepository._refresh_static_watermark() - scripts/
+        load_static.py runs as a separate process from this one, so it can't
+        clear this process's in-memory caches directly; this detects a reload
+        on its own via the same cheap meta-table point lookup."""
+        row = db.get_connection().execute(
+            "SELECT value FROM meta WHERE key='static_loaded_at'").fetchone()
+        watermark = row["value"] if row else None
+        if watermark != self._static_loaded_watermark:
+            self._static_loaded_watermark = watermark
+            self._static_meta_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+            self._route_shape_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+
     # ---- static -----------------------------------------------------------
     def static_feed_meta(self) -> Dict[str, Any]:
-        c = db.get_connection()
-        out: Dict[str, Any] = {}
-        for table, key in (
-            ("gtfs_agency", "agencies"), ("gtfs_routes", "routes"),
-            ("gtfs_stops", "stops"), ("gtfs_trips", "trips"),
-            ("gtfs_stop_times", "stop_times"), ("gtfs_shapes", "shape_points"),
-        ):
-            out[key] = c.execute("SELECT COUNT(*) AS n FROM " + table).fetchone()["n"]
-        bbox = c.execute(
-            "SELECT MIN(stop_lat) AS min_lat, MIN(stop_lon) AS min_lon, "
-            "MAX(stop_lat) AS max_lat, MAX(stop_lon) AS max_lon FROM gtfs_stops"
-        ).fetchone()
-        out["bbox"] = dict(bbox) if bbox and bbox["min_lat"] is not None else None
-        loaded = c.execute("SELECT value FROM meta WHERE key='static_loaded_at'").fetchone()
-        out["static_loaded_at"] = int(loaded["value"]) if loaded else None
-        return out
+        self._refresh_static_watermark()
+        def compute() -> Dict[str, Any]:
+            c = db.get_connection()
+            out: Dict[str, Any] = {}
+            for table, key in (
+                ("gtfs_agency", "agencies"), ("gtfs_routes", "routes"),
+                ("gtfs_stops", "stops"), ("gtfs_trips", "trips"),
+                ("gtfs_stop_times", "stop_times"), ("gtfs_shapes", "shape_points"),
+            ):
+                out[key] = c.execute("SELECT COUNT(*) AS n FROM " + table).fetchone()["n"]
+            bbox = c.execute(
+                "SELECT MIN(stop_lat) AS min_lat, MIN(stop_lon) AS min_lon, "
+                "MAX(stop_lat) AS max_lat, MAX(stop_lon) AS max_lon FROM gtfs_stops"
+            ).fetchone()
+            out["bbox"] = dict(bbox) if bbox and bbox["min_lat"] is not None else None
+            loaded = c.execute("SELECT value FROM meta WHERE key='static_loaded_at'").fetchone()
+            out["static_loaded_at"] = int(loaded["value"]) if loaded else None
+            return out
+        return self._static_meta_cache.get_or_compute("static_feed_meta", compute)
 
     def feed_summary(self) -> Dict[str, Any]:
-        out = self.static_feed_meta()
+        out = dict(self.static_feed_meta())
         out["history_rows"] = db.get_connection().execute(
             "SELECT COUNT(*) AS n FROM rt_vehicle_position").fetchone()["n"]
         return out
@@ -71,19 +103,22 @@ class SqliteRepository(Repository):
         return dict(row) if row else None
 
     def route_shape(self, route_id: str) -> List[List[float]]:
-        c = db.get_connection()
-        # Pick the shape with the most points: for a route with variants that is
-        # the fullest representation of the corridor.
-        shape = c.execute(
-            "SELECT s.shape_id FROM gtfs_shapes s "
-            "WHERE s.shape_id IN (SELECT DISTINCT shape_id FROM gtfs_trips WHERE route_id=?) "
-            "GROUP BY s.shape_id ORDER BY COUNT(*) DESC LIMIT 1", (route_id,)).fetchone()
-        if not shape:
-            return []
-        pts = c.execute(
-            "SELECT shape_pt_lon, shape_pt_lat FROM gtfs_shapes WHERE shape_id=? "
-            "ORDER BY shape_pt_sequence", (shape["shape_id"],)).fetchall()
-        return [[p["shape_pt_lon"], p["shape_pt_lat"]] for p in pts]
+        self._refresh_static_watermark()
+        def compute() -> List[List[float]]:
+            c = db.get_connection()
+            # Pick the shape with the most points: for a route with variants
+            # that is the fullest representation of the corridor.
+            shape = c.execute(
+                "SELECT s.shape_id FROM gtfs_shapes s "
+                "WHERE s.shape_id IN (SELECT DISTINCT shape_id FROM gtfs_trips WHERE route_id=?) "
+                "GROUP BY s.shape_id ORDER BY COUNT(*) DESC LIMIT 1", (route_id,)).fetchone()
+            if not shape:
+                return []
+            pts = c.execute(
+                "SELECT shape_pt_lon, shape_pt_lat FROM gtfs_shapes WHERE shape_id=? "
+                "ORDER BY shape_pt_sequence", (shape["shape_id"],)).fetchall()
+            return [[p["shape_pt_lon"], p["shape_pt_lat"]] for p in pts]
+        return list(self._route_shape_cache.get_or_compute(route_id, compute))
 
     def route_stops(self, route_id: str) -> List[Dict[str, Any]]:
         c = db.get_connection()
@@ -694,6 +729,66 @@ class SqliteRepository(Repository):
             "SELECT polled_at, ok, source, http_status, entity_count, new_rows, "
             "feed_timestamp, latency_ms, error FROM rt_poll_log "
             "WHERE polled_at >= ? ORDER BY polled_at", (since_ts,)))
+
+    # ---- live <-> static trip linkage ---------------------------------------
+    def scheduled_trip_keys(self) -> List[Tuple[str, str]]:
+        c = db.get_connection()
+        return [(r["route_id"], r["trip_id"]) for r in
+                c.execute("SELECT route_id, trip_id FROM gtfs_trips").fetchall()]
+
+    def distinct_live_trip_keys(self, since_ts: int, until_ts: int) -> List[Dict[str, Any]]:
+        c = db.get_connection()
+        # SQLite has no DISTINCT ON; the same "most recent report per key"
+        # shape via a self-join against the per-key max(ts).
+        return _rows(c.execute(
+            "SELECT v.route_id, v.trip_id, v.vehicle_id FROM rt_vehicle_position v "
+            "JOIN (SELECT route_id, trip_id, MAX(ts) AS ts FROM rt_vehicle_position "
+            "      WHERE ts >= ? AND ts < ? AND trip_id IS NOT NULL AND route_id IS NOT NULL "
+            "      GROUP BY route_id, trip_id) m "
+            "ON m.route_id = v.route_id AND m.trip_id = v.trip_id AND m.ts = v.ts",
+            (since_ts, until_ts)))
+
+    def upsert_trip_matches(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        c = db.get_connection()
+        c.executemany(
+            "INSERT INTO live_trip_match (live_trip_id, vehicle_id, route_id, "
+            "matched_trip_id, match_type, delta_minutes, matched_at) "
+            "VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT (live_trip_id) DO UPDATE SET "
+            "vehicle_id = excluded.vehicle_id, route_id = excluded.route_id, "
+            "matched_trip_id = excluded.matched_trip_id, "
+            "match_type = excluded.match_type, delta_minutes = excluded.delta_minutes, "
+            "matched_at = excluded.matched_at",
+            [(r["live_trip_id"], r["vehicle_id"], r["route_id"], r.get("matched_trip_id"),
+              r["match_type"], r.get("delta_minutes"), r["matched_at"]) for r in rows])
+        c.commit()
+
+    def trip_match(self, live_trip_id: str) -> Optional[Dict[str, Any]]:
+        c = db.get_connection()
+        row = c.execute(
+            "SELECT live_trip_id, vehicle_id, route_id, matched_trip_id, "
+            "match_type, delta_minutes, matched_at FROM live_trip_match "
+            "WHERE live_trip_id = ?", (live_trip_id,)).fetchone()
+        return dict(row) if row else None
+
+    def trip_match_summary(self, since_ts: int) -> Dict[str, Any]:
+        c = db.get_connection()
+        rows = c.execute(
+            "SELECT match_type, COUNT(*) AS n FROM live_trip_match "
+            "WHERE matched_at >= ? GROUP BY match_type", (since_ts,)).fetchall()
+        counts = {r["match_type"]: r["n"] for r in rows}
+        total = sum(counts.values())
+        return {
+            "total": total,
+            "strict": counts.get("strict", 0),
+            "relaxed": counts.get("relaxed", 0),
+            "none": counts.get("none", 0),
+            "strict_pct": round(counts.get("strict", 0) * 100.0 / total, 1) if total else None,
+            "linked_pct": round((counts.get("strict", 0) + counts.get("relaxed", 0))
+                                * 100.0 / total, 1) if total else None,
+        }
 
 
 repository: Repository = SqliteRepository()

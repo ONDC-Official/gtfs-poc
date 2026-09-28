@@ -297,8 +297,20 @@ class QualityService:
             "referential_integrity": {
                 "total": ref.get("total") or 0,
                 "invalid_route_id": ref.get("invalid_route_id") or 0,
+                # Strict trip_id equality against gtfs_trips - almost always
+                # non-zero by construction (see schedule_link below): a live
+                # trip_id carries the vehicle's actual dispatch time and a
+                # sequence number, so it is not the static trip_id even when
+                # the trip is genuinely scheduled. Kept for raw-ID sanity
+                # (an empty or malformed trip_id still shows up here); not a
+                # measure of whether the trip is on the timetable.
                 "invalid_trip_id": ref.get("invalid_trip_id") or 0,
             },
+            # The corrected version of the line above: whether each live trip
+            # matches a timetabled departure on its route, computed by
+            # TripMatcher and stored in live_trip_match by the aggregator
+            # (batched, not per-request - see Aggregator._match_new_trips).
+            "schedule_link": self.repo.trip_match_summary(since_ts),
             "duplicate_snapshot_rate": {
                 "polls": len(counted_polls), "duplicates": len(dup_polls),
                 "pct": _pct(len(dup_polls), len(counted_polls)),

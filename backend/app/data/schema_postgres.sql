@@ -139,6 +139,15 @@ CREATE INDEX IF NOT EXISTS ix_vp_geom     ON rt_vehicle_position USING GIST (geo
 -- vehicle in [since, until]" query. Declared on the partitioned parent, so
 -- Postgres propagates it to every existing and future day partition.
 CREATE INDEX IF NOT EXISTS ix_vp_vehicle_ts ON rt_vehicle_position(vehicle_id, ts DESC);
+-- Same idea for distinct_live_trip_keys()'s DISTINCT ON (route_id, trip_id)
+-- ... ORDER BY route_id, trip_id, ts DESC (Aggregator._match_new_trips,
+-- every 6h). Without this the query had no index touching trip_id at all,
+-- so it would fall back to a full sort of the whole [since, until) window -
+-- the same shape of unindexed scan on this table that caused the original
+-- CPU incident this deployment already lived through. The RANGE partition
+-- on ts already prunes to at most the 1-2 day partitions a chunk can span;
+-- this index is what makes the DISTINCT ON cheap *within* those.
+CREATE INDEX IF NOT EXISTS ix_vp_route_trip_ts ON rt_vehicle_position(route_id, trip_id, ts DESC);
 
 -- Create the daily partition covering the given unix-second timestamp, if it
 -- does not already exist. Idempotent - a lost race just raises
@@ -155,6 +164,11 @@ BEGIN
     EXECUTE format(
         'CREATE TABLE %I PARTITION OF rt_vehicle_position FOR VALUES FROM (%s) TO (%s)',
         part_name, day_start, day_end);
+    -- Empty partition, so this validates instantly - no NOT VALID needed
+    -- here, unlike the one-time backfill over existing partitions above.
+    EXECUTE format(
+        'ALTER TABLE %I ADD CONSTRAINT fk_vp_route '
+        'FOREIGN KEY (route_id) REFERENCES gtfs_routes(route_id)', part_name);
 EXCEPTION
     WHEN duplicate_table THEN NULL;           -- already carved
     WHEN invalid_object_definition THEN NULL; -- overlaps an existing partition
@@ -195,6 +209,87 @@ BEGIN
     RETURN dropped;
 END;
 $$;
+
+-- Foreign key from the live feed's route_id back to the static timetable.
+--
+-- Deliberately left NO ACTION (the default) on delete, not ON DELETE
+-- SET NULL/CASCADE, unlike live_trip_match.matched_trip_id below. The two
+-- look like the same situation but aren't: a route_id here is a *fact this
+-- service measured* - a bus really did report this route at this time - so
+-- silently nulling it out because someone deleted the row from gtfs_routes
+-- would quietly corrupt real history. If a future static-feed refresh ever
+-- needs to remove a route_id that live data has referenced, that removal
+-- SHOULD fail loudly (this FK) rather than succeed by erasing what buses
+-- actually reported. A route refresh should be an upsert (INSERT ... ON
+-- CONFLICT (route_id) DO UPDATE), never a delete-and-reinsert, for exactly
+-- this reason - route_id is meant to be a stable identifier across feed
+-- versions in practice anyway. (No such refresh path exists in this
+-- codebase yet; this comment is here so the choice is a decision, not an
+-- accident, whenever one gets built.)
+--
+-- This can't be declared once on the partitioned parent the ordinary way:
+-- Postgres (through at least 16, which is what's deployed) refuses a
+-- NOT VALID foreign key on a partitioned table outright -
+-- "This feature is not yet supported on partitioned tables" - and a
+-- non-NOT VALID one validates every partition inline, which on
+-- rt_vehicle_position's 20M+ rows would hold a lock for the length of that
+-- scan during whatever startup runs this. Confirmed against a real
+-- Postgres 16 instance while building this, not assumed.
+--
+-- So the constraint is added per partition instead - each partition is an
+-- ordinary table, where NOT VALID is allowed - looping over whatever
+-- partitions already exist. Every *future* day's partition gets the same
+-- constraint at creation time in rt_ensure_day_partition() below, fully
+-- validated there for free since a brand-new partition starts empty.
+-- Validating today's already-existing partitions against their (currently
+-- 20M+ row) history is left as a deliberate manual step, one partition at a
+-- time, off-peak:
+--   ALTER TABLE rt_vehicle_position_20260927 VALIDATE CONSTRAINT fk_vp_route;
+DO $$
+DECLARE
+    part regclass;
+BEGIN
+    FOR part IN
+        SELECT i.inhrelid FROM pg_inherits i WHERE i.inhparent = 'rt_vehicle_position'::regclass
+    LOOP
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'fk_vp_route' AND conrelid = part
+        ) THEN
+            EXECUTE format(
+                'ALTER TABLE %s ADD CONSTRAINT fk_vp_route '
+                'FOREIGN KEY (route_id) REFERENCES gtfs_routes(route_id) NOT VALID',
+                part);
+        END IF;
+    END LOOP;
+END $$;
+
+-- Anything the app layer kept out of rt_vehicle_position because its
+-- route_id doesn't exist in gtfs_routes - see Repository.upsert_vehicles()
+-- for why this is filtered in Python before the insert rather than left to
+-- the FK above to reject: a single bad row inside one poll's batched
+-- executemany() would otherwise roll back that whole poll's insert, not
+-- just the bad row. Same shape as rt_vehicle_position, plus why/when.
+CREATE TABLE IF NOT EXISTS rt_vehicle_position_deadletter (
+    id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    vehicle_id       text   NOT NULL,
+    ts               bigint NOT NULL,
+    trip_id          text,
+    route_id         text,
+    lat              double precision,
+    lon              double precision,
+    bearing          double precision,
+    speed            double precision,
+    stop_id          text,
+    current_status   integer,
+    congestion_level integer,
+    occupancy_status integer,
+    ingested_at      bigint NOT NULL,
+    reason           text   NOT NULL,     -- e.g. 'unknown_route_id'
+    quarantined_at   bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_vp_dl_route ON rt_vehicle_position_deadletter(route_id);
+CREATE INDEX IF NOT EXISTS ix_vp_dl_ts    ON rt_vehicle_position_deadletter(quarantined_at);
 
 -- Current-state projection: exactly one row per vehicle, upserted each poll.
 CREATE TABLE IF NOT EXISTS rt_vehicle_latest (
@@ -311,3 +406,44 @@ CREATE TABLE IF NOT EXISTS analytics_continuity_hour (
 -- grid/route watermark ('aggregate_watermark_ts') because this one must never
 -- rewind (see comment above): rewinding would double-count into the additive
 -- counters here.
+
+-- Derived relationship between a live trip and the static timetable. Can't
+-- be a plain FOREIGN KEY on rt_vehicle_position.trip_id the way route_id got
+-- one (see fk_vp_route above): a live trip_id encodes the vehicle's actual
+-- dispatch time and a running sequence number - it is never equal to a
+-- static trip_id, and the feed marks every trip schedule_relationship=ADDED,
+-- meaning the provider itself says none of them are scheduled trips. So the
+-- match is computed (nearest timetabled departure on the same route, within
+-- a tolerance) and stored here instead of enforced as a column constraint.
+-- matched_trip_id *is* a real FK, because it points at an actual static
+-- trip once a match exists. Populated by Aggregator._match_new_trips() /
+-- app/services/trip_matcher.py, not at ingest time - matching is a batched,
+-- 6-hourly job for the same reason the rollup is (see aggregator.py).
+--
+-- ON DELETE SET NULL here, unlike fk_vp_route above - and this asymmetry is
+-- deliberate, not an inconsistency. This column isn't a measured fact, it's
+-- this service's own best-effort annotation ("we think this live trip
+-- corresponds to that scheduled one"). If a static-feed refresh ever removes
+-- the matched static trip, the honest answer becomes "we don't have a match
+-- for this anymore" - matched_trip_id -> NULL - rather than blocking the
+-- refresh outright the way losing a *measured* route_id would. match_type
+-- is left as whatever it was: a dangling NULL match_type='strict' row is a
+-- readable historical record ("this was a confident match against a
+-- timetable that has since changed"), and any live trip still inside the
+-- aggregator's watermark window gets a fresh match next tick regardless.
+CREATE TABLE IF NOT EXISTS live_trip_match (
+    live_trip_id    text   PRIMARY KEY,
+    vehicle_id      text   NOT NULL,
+    route_id        text   NOT NULL,
+    matched_trip_id text   REFERENCES gtfs_trips(trip_id) ON DELETE SET NULL,
+    match_type      text   NOT NULL CHECK (match_type IN ('strict', 'relaxed', 'none')),
+    delta_minutes   double precision,
+    matched_at      bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_ltm_vehicle     ON live_trip_match(vehicle_id);
+CREATE INDEX IF NOT EXISTS ix_ltm_route       ON live_trip_match(route_id);
+CREATE INDEX IF NOT EXISTS ix_ltm_match_type  ON live_trip_match(match_type);
+CREATE INDEX IF NOT EXISTS ix_ltm_matched_at  ON live_trip_match(matched_at);
+-- Watermark: meta key 'trip_match_watermark_ts', same shape as the grid/route
+-- one - rewinds a little on every pass so a trip whose vehicle is still
+-- mid-dispatch when first seen gets re-matched once more is-known.

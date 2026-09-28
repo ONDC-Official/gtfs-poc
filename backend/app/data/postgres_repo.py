@@ -13,16 +13,31 @@ ST_DWithin against the generated geom column, and routes_nearby reports exact
 geodesic metres via ST_Distance on geography.
 """
 import time
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import pg
 from .repository import Repository
+from ..services.singleflight import SingleFlightCache
 
 _VEHICLE_COLS = (
     "vehicle_id, ts, trip_id, route_id, lat, lon, bearing, speed, stop_id, "
     "current_status, congestion_level, occupancy_status, ingested_at"
 )
 _VEHICLE_PLACEHOLDERS = "(" + ",".join(["%s"] * 13) + ")"
+
+# See _known_route_ids(): how long the cached gtfs_routes set is trusted
+# before upsert_vehicles() will re-query it.
+KNOWN_ROUTES_TTL_S = 300.0
+
+# See static_feed_meta()/route_shape() below: how long their cached results
+# are trusted. Longer than KNOWN_ROUTES_TTL_S on purpose - this data (table
+# row counts, the stop bbox, a route's shape points) is even less likely to
+# change than the route list, and there is no static-feed-reload code path in
+# this deployment at all today. Still finite, not permanent: if a reload is
+# ever added, a stale value here self-heals within the hour on its own,
+# without needing an app restart - and invalidate_static_cache() (below)
+# gives an explicit, immediate way to force that refresh instead of waiting.
+STATIC_DATA_TTL_S = 3600.0
 
 # Postgres tolerates 65535 bind parameters; keep a conservative chunk so a
 # pathological interchange with thousands of serving stops still fits.
@@ -40,6 +55,40 @@ def _vehicle_values(rows: List[Dict[str, Any]]):
 
 
 class PostgresRepository(Repository):
+    def __init__(self):
+        self._route_cache = SingleFlightCache(ttl_s=KNOWN_ROUTES_TTL_S)
+        self._static_meta_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+        self._route_shape_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+        # See _refresh_static_watermark() below.
+        self._static_loaded_watermark: Optional[str] = None
+
+    def invalidate_static_cache(self) -> None:
+        """Forces the next static_feed_meta()/route_shape() call to hit the
+        database instead of serving a cached value. Does not touch
+        _route_cache - that one already self-heals on its own five-minute
+        schedule and upsert_vehicles quarantines rather than fails on a miss
+        either way."""
+        self._static_meta_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+        self._route_shape_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+
+    def _refresh_static_watermark(self) -> None:
+        """scripts/load_static.py runs as a separate OS process - it has no
+        way to reach into *this* process's cache objects, so calling
+        invalidate_static_cache() from there does nothing here. Instead this
+        process detects a reload on its own: meta.static_loaded_at is a
+        single-row point lookup by primary key (a few bytes), cheap enough to
+        check on every static_feed_meta()/route_shape() call even on a cache
+        hit - nothing like the multi-million-row COUNT(*) scans STATIC_DATA_TTL_S
+        exists to avoid. When it changes, a reload actually happened, so both
+        caches are cleared immediately instead of serving stale data for up
+        to an hour."""
+        row = self._one("SELECT value FROM meta WHERE key = 'static_loaded_at'")
+        watermark = row["value"] if row else None
+        if watermark != self._static_loaded_watermark:
+            self._static_loaded_watermark = watermark
+            self._static_meta_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+            self._route_shape_cache = SingleFlightCache(ttl_s=STATIC_DATA_TTL_S)
+
     # ---- helpers --------------------------------------------------------------
     @staticmethod
     def _all(sql: str, params: Sequence[Any] = ()) -> List[Dict[str, Any]]:
@@ -53,27 +102,41 @@ class PostgresRepository(Repository):
 
     # ---- static ------------------------------------------------------------
     def static_feed_meta(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        with pg.pool().connection() as conn:
-            for table, key in (
-                ("gtfs_agency", "agencies"), ("gtfs_routes", "routes"),
-                ("gtfs_stops", "stops"), ("gtfs_trips", "trips"),
-                ("gtfs_stop_times", "stop_times"), ("gtfs_shapes", "shape_points"),
-            ):
-                out[key] = conn.execute(
-                    "SELECT COUNT(*) AS n FROM " + table).fetchone()["n"]
-            bbox = conn.execute(
-                "SELECT MIN(stop_lat) AS min_lat, MIN(stop_lon) AS min_lon, "
-                "MAX(stop_lat) AS max_lat, MAX(stop_lon) AS max_lon FROM gtfs_stops"
-            ).fetchone()
-            out["bbox"] = dict(bbox) if bbox and bbox["min_lat"] is not None else None
-            loaded = conn.execute(
-                "SELECT value FROM meta WHERE key = 'static_loaded_at'").fetchone()
-            out["static_loaded_at"] = int(loaded["value"]) if loaded else None
-        return out
+        # Cached: this was being computed from scratch up to 4 times per
+        # deployment (coverage(), correctness(), a third quality layer, and
+        # feed_summary() below each called it separately - 3 of those inside
+        # one single summary() pass) against 6 static tables including two
+        # multi-million-row COUNT(*) scans (gtfs_stop_times, gtfs_shapes),
+        # none of which have changed since the feed was loaded. See
+        # STATIC_DATA_TTL_S.
+        self._refresh_static_watermark()
+        def compute() -> Dict[str, Any]:
+            out: Dict[str, Any] = {}
+            with pg.pool().connection() as conn:
+                for table, key in (
+                    ("gtfs_agency", "agencies"), ("gtfs_routes", "routes"),
+                    ("gtfs_stops", "stops"), ("gtfs_trips", "trips"),
+                    ("gtfs_stop_times", "stop_times"), ("gtfs_shapes", "shape_points"),
+                ):
+                    out[key] = conn.execute(
+                        "SELECT COUNT(*) AS n FROM " + table).fetchone()["n"]
+                bbox = conn.execute(
+                    "SELECT MIN(stop_lat) AS min_lat, MIN(stop_lon) AS min_lon, "
+                    "MAX(stop_lat) AS max_lat, MAX(stop_lon) AS max_lon FROM gtfs_stops"
+                ).fetchone()
+                out["bbox"] = dict(bbox) if bbox and bbox["min_lat"] is not None else None
+                loaded = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'static_loaded_at'").fetchone()
+                out["static_loaded_at"] = int(loaded["value"]) if loaded else None
+            return out
+        return self._static_meta_cache.get_or_compute("static_feed_meta", compute)
 
     def feed_summary(self) -> Dict[str, Any]:
-        out = self.static_feed_meta()
+        out = dict(self.static_feed_meta())
+        # history_rows is deliberately computed fresh every call, outside the
+        # cache above: it's the one genuinely live figure here (this service's
+        # own ever-growing position history), not static feed metadata - an
+        # actual data-collection number must never come from a stale cache.
         # An exact COUNT(*) here is a full scan across every day-partition -
         # caught live taking 47s+ and holding a pool connection the whole
         # time, which is what actually caused the PoolTimeout/504s (not the
@@ -114,16 +177,27 @@ class PostgresRepository(Repository):
             "AS trip_count FROM gtfs_routes r WHERE r.route_id = %s", (route_id,))
 
     def route_shape(self, route_id: str) -> List[List[float]]:
-        shape = self._one(
-            "SELECT s.shape_id FROM gtfs_shapes s "
-            "WHERE s.shape_id IN (SELECT DISTINCT shape_id FROM gtfs_trips WHERE route_id = %s) "
-            "GROUP BY s.shape_id ORDER BY COUNT(*) DESC LIMIT 1", (route_id,))
-        if not shape:
-            return []
-        pts = self._all(
-            "SELECT shape_pt_lon, shape_pt_lat FROM gtfs_shapes WHERE shape_id = %s "
-            "ORDER BY shape_pt_sequence", (shape["shape_id"],))
-        return [[p["shape_pt_lon"], p["shape_pt_lat"]] for p in pts]
+        # Cached per route_id: correctness()'s off-route check calls this
+        # once for each of up to OFF_ROUTE_MAX_ROUTES (150) busiest routes,
+        # every summary() computation - up to 150 x 2 queries against a
+        # route's shape, which has never changed since the feed was loaded.
+        # See STATIC_DATA_TTL_S.
+        self._refresh_static_watermark()
+        def compute() -> List[List[float]]:
+            shape = self._one(
+                "SELECT s.shape_id FROM gtfs_shapes s "
+                "WHERE s.shape_id IN (SELECT DISTINCT shape_id FROM gtfs_trips WHERE route_id = %s) "
+                "GROUP BY s.shape_id ORDER BY COUNT(*) DESC LIMIT 1", (route_id,))
+            if not shape:
+                return []
+            pts = self._all(
+                "SELECT shape_pt_lon, shape_pt_lat FROM gtfs_shapes WHERE shape_id = %s "
+                "ORDER BY shape_pt_sequence", (shape["shape_id"],))
+            return [[p["shape_pt_lon"], p["shape_pt_lat"]] for p in pts]
+        # A fresh list every call, even on a cache hit: all three current
+        # callers only read it, but returning the cache's own list object
+        # would let a future caller silently corrupt it for everyone else.
+        return list(self._route_shape_cache.get_or_compute(route_id, compute))
 
     def route_stops(self, route_id: str) -> List[Dict[str, Any]]:
         trip = self._one(
@@ -236,6 +310,22 @@ class PostgresRepository(Repository):
     def upsert_vehicles(self, rows: List[Dict[str, Any]]) -> int:
         if not rows:
             return 0
+
+        # rt_vehicle_position.route_id carries a FOREIGN KEY to gtfs_routes
+        # (schema_postgres.sql). Filtering unknown routes out here, before
+        # the insert, rather than letting that FK reject them, is deliberate:
+        # the insert below is one executemany() over the whole poll's batch
+        # inside one transaction, so a single bad row would roll back every
+        # vehicle in that poll, not just the bad one. Known routes (the
+        # overwhelming majority - 0 unknown route_ids found across 22M+ rows
+        # in production before this was added) go through unchanged; the
+        # rest are quarantined, not dropped - see _quarantine_unknown_routes.
+        rows, quarantined = self._split_unknown_routes(rows)
+        if quarantined:
+            self._quarantine_unknown_routes(quarantined)
+        if not rows:
+            return 0
+
         values = _vehicle_values(rows)
         days = {(r["ts"] // 86400) * 86400 for r in rows}
         with pg.pool().connection() as conn:
@@ -269,6 +359,56 @@ class PostgresRepository(Repository):
                         "ingested_at = EXCLUDED.ingested_at "
                         "WHERE rt_vehicle_latest.ts <= EXCLUDED.ts", values)
         return max(inserted, 0)
+
+    def _known_route_ids(self) -> set:
+        """The full set of gtfs_routes.route_id, cached for KNOWN_ROUTES_TTL_S.
+        Without this, _split_unknown_routes queried gtfs_routes once per
+        upsert_vehicles call - once per poll, every RT_POLL_SECONDS (10s in
+        production) - purely to filter out routes that essentially never
+        appear (0 found across 22M+ production rows before this existed).
+        That's ~8,600 extra small queries/day added to the write path of a
+        database that has already been the source of more than one CPU
+        incident in this deployment. gtfs_routes only changes when the
+        static feed is reloaded - there is no reload path at all today - so
+        a several-minute staleness window costs nothing real: a genuinely
+        new route just quarantines for up to KNOWN_ROUTES_TTL_S until the
+        cache catches up, rather than failing outright."""
+        return set(self._route_cache.get_or_compute(
+            "gtfs_routes.route_id",
+            lambda: {r["route_id"] for r in self._all("SELECT route_id FROM gtfs_routes")}))
+
+    def _split_unknown_routes(self, rows: List[Dict[str, Any]]):
+        """(kept_rows, quarantined_rows). A row with route_id=None is kept -
+        the FK only constrains a *present* route_id, matching the column
+        being nullable today; only a route_id that names something absent
+        from gtfs_routes gets quarantined."""
+        candidate_ids = {r["route_id"] for r in rows if r.get("route_id")}
+        if not candidate_ids:
+            return rows, []
+        unknown = candidate_ids - self._known_route_ids()
+        if not unknown:
+            return rows, []
+        kept, quarantined = [], []
+        for r in rows:
+            (quarantined if r.get("route_id") in unknown else kept).append(r)
+        return kept, quarantined
+
+    def _quarantine_unknown_routes(self, rows: List[Dict[str, Any]]) -> None:
+        now = int(time.time())
+        values = [v + ("unknown_route_id", now) for v in _vehicle_values(rows)]
+        with pg.pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO rt_vehicle_position_deadletter (" +
+                    _VEHICLE_COLS + ", reason, quarantined_at) VALUES " +
+                    _VEHICLE_PLACEHOLDERS[:-1] + ", %s, %s)", values)
+
+    def deadletter_count(self, since_ts: Optional[int] = None) -> int:
+        if since_ts is None:
+            return self._one("SELECT COUNT(*) AS n FROM rt_vehicle_position_deadletter")["n"]
+        return self._one(
+            "SELECT COUNT(*) AS n FROM rt_vehicle_position_deadletter "
+            "WHERE quarantined_at >= %s", (since_ts,))["n"]
 
     def latest_vehicles(self, route_id: Optional[str],
                         bbox: Optional[Sequence[float]],
@@ -706,6 +846,61 @@ class PostgresRepository(Repository):
             "SELECT polled_at, ok, source, http_status, entity_count, new_rows, "
             "feed_timestamp, latency_ms, error FROM rt_poll_log "
             "WHERE polled_at >= %s ORDER BY polled_at", (since_ts,))
+
+    # ---- live <-> static trip linkage ---------------------------------------
+    def scheduled_trip_keys(self) -> List[Tuple[str, str]]:
+        return [(r["route_id"], r["trip_id"]) for r in
+                self._all("SELECT route_id, trip_id FROM gtfs_trips")]
+
+    def distinct_live_trip_keys(self, since_ts: int, until_ts: int) -> List[Dict[str, Any]]:
+        return self._all(
+            "SELECT DISTINCT ON (route_id, trip_id) route_id, trip_id, vehicle_id "
+            "FROM rt_vehicle_position "
+            "WHERE ts >= %(since)s AND ts < %(until)s "
+            "AND trip_id IS NOT NULL AND route_id IS NOT NULL "
+            "ORDER BY route_id, trip_id, ts DESC",
+            {"since": since_ts, "until": until_ts})
+
+    def upsert_trip_matches(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        values = [(r["live_trip_id"], r["vehicle_id"], r["route_id"],
+                   r.get("matched_trip_id"), r["match_type"], r.get("delta_minutes"),
+                   r["matched_at"]) for r in rows]
+        with pg.pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "INSERT INTO live_trip_match (live_trip_id, vehicle_id, route_id, "
+                    "matched_trip_id, match_type, delta_minutes, matched_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s) "
+                    "ON CONFLICT (live_trip_id) DO UPDATE SET "
+                    "vehicle_id = EXCLUDED.vehicle_id, route_id = EXCLUDED.route_id, "
+                    "matched_trip_id = EXCLUDED.matched_trip_id, "
+                    "match_type = EXCLUDED.match_type, "
+                    "delta_minutes = EXCLUDED.delta_minutes, "
+                    "matched_at = EXCLUDED.matched_at", values)
+
+    def trip_match(self, live_trip_id: str) -> Optional[Dict[str, Any]]:
+        return self._one(
+            "SELECT live_trip_id, vehicle_id, route_id, matched_trip_id, "
+            "match_type, delta_minutes, matched_at FROM live_trip_match "
+            "WHERE live_trip_id = %s", (live_trip_id,))
+
+    def trip_match_summary(self, since_ts: int) -> Dict[str, Any]:
+        rows = self._all(
+            "SELECT match_type, COUNT(*) AS n FROM live_trip_match "
+            "WHERE matched_at >= %s GROUP BY match_type", (since_ts,))
+        counts = {r["match_type"]: r["n"] for r in rows}
+        total = sum(counts.values())
+        return {
+            "total": total,
+            "strict": counts.get("strict", 0),
+            "relaxed": counts.get("relaxed", 0),
+            "none": counts.get("none", 0),
+            "strict_pct": round(counts.get("strict", 0) * 100.0 / total, 1) if total else None,
+            "linked_pct": round((counts.get("strict", 0) + counts.get("relaxed", 0))
+                                * 100.0 / total, 1) if total else None,
+        }
 
 
 repository: Repository = PostgresRepository()

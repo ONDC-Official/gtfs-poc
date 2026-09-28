@@ -5,7 +5,7 @@ one implementation today; a Postgres/PostGIS or DuckDB implementation for the
 analytics tier plugs in here without any service-layer change.
 """
 import abc
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 class Repository(abc.ABC):
@@ -234,3 +234,37 @@ class Repository(abc.ABC):
         """Poll log rows since `since_ts`, oldest first - a time-bounded
         counterpart to `recent_polls` for volume-stability and error-breakdown
         stats that need a full window rather than a row count. Layers 6.2, 6.3."""
+
+    # ---- live <-> static trip linkage ---------------------------------------
+    # See schema_postgres.sql's comment on `live_trip_match` for why this is a
+    # derived, batched match rather than a FOREIGN KEY on trip_id.
+
+    @abc.abstractmethod
+    def scheduled_trip_keys(self) -> List[Tuple[str, str]]:
+        """Every static (route_id, trip_id) pair. Small (tens of thousands of
+        rows) and rarely changes - TripMatcher loads this once and holds it in
+        memory rather than querying per live trip."""
+
+    @abc.abstractmethod
+    def distinct_live_trip_keys(self, since_ts: int, until_ts: int) -> List[Dict[str, Any]]:
+        """One row per distinct (route_id, trip_id) seen in [since_ts, until_ts)
+        - {route_id, trip_id, vehicle_id} using that pair's most recent report,
+        so a vehicle that changed trip_id mid-poll doesn't produce duplicates."""
+
+    @abc.abstractmethod
+    def upsert_trip_matches(self, rows: List[Dict[str, Any]]) -> None:
+        """Bulk upsert into live_trip_match. Each row: live_trip_id,
+        vehicle_id, route_id, matched_trip_id, match_type, delta_minutes,
+        matched_at."""
+
+    @abc.abstractmethod
+    def trip_match(self, live_trip_id: str) -> Optional[Dict[str, Any]]:
+        """The stored match for one live trip_id, or None if it hasn't been
+        matched yet (still within the current watermark's lag, or the trip
+        never made it into a batch)."""
+
+    @abc.abstractmethod
+    def trip_match_summary(self, since_ts: int) -> Dict[str, Any]:
+        """Counts by match_type for trips matched since `since_ts` - what
+        Grafana's corrected "schedule link" panel and the quality tier read
+        instead of each recomputing the match inline."""

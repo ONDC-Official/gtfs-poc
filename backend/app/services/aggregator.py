@@ -23,6 +23,7 @@ from typing import Any, Dict, Optional
 
 from ..config import settings
 from ..data.repository import Repository
+from .trip_matcher import TripMatcher
 
 log = logging.getLogger("gtfs.aggregator")
 
@@ -57,6 +58,19 @@ CONTINUITY_WATERMARK_KEY = "continuity_watermark_ts"
 # see Aggregator._fold_continuity.
 CONTINUITY_CHUNK_S = 86400   # at most one day of backlog per aggregator tick
 
+TRIP_MATCH_WATERMARK_KEY = "trip_match_watermark_ts"
+# Rewind a little on every pass, same reasoning as WATERMARK_KEY above: a
+# vehicle mid-dispatch when its trip was first seen might report a couple more
+# positions under the same trip_id, but matching only cares that the trip_id
+# existed at all, so a short rewind (not an hour - trip_ids don't retroactively
+# change) is enough to catch a trip whose only report so far landed right at
+# the edge of the previous pass's window.
+TRIP_MATCH_REWIND_S = 600
+# At most this much backlog per tick, same shape as CONTINUITY_CHUNK_S - keeps
+# a stale watermark (first run, or catching up after downtime) from turning
+# one aggregator tick into an unbounded scan.
+TRIP_MATCH_CHUNK_S = 86400
+
 
 class Aggregator:
     def __init__(self, repo: Repository, interval_s: int = 120):
@@ -65,6 +79,7 @@ class Aggregator:
         self._task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
         self.last_run: Optional[Dict[str, Any]] = None
+        self._trip_matcher = TripMatcher(repo)
 
     # ---- lifecycle --------------------------------------------------------
     async def start(self) -> None:
@@ -126,6 +141,7 @@ class Aggregator:
         self.repo.meta_set(WATERMARK_KEY, str(int(newest)))
 
         continuity = self._fold_continuity(newest)
+        trip_match = self._match_new_trips(newest)
 
         counts = self.repo.rollup_counts()
         return {
@@ -134,8 +150,40 @@ class Aggregator:
             "routes": counts["routes"],
             "watermark": int(newest),
             "continuity": continuity,
+            "trip_match": trip_match,
             "elapsed_ms": int((time.perf_counter() - started) * 1000),
         }
+
+    def _match_new_trips(self, newest: int) -> Dict[str, Any]:
+        """One bounded step of live-trip-to-timetable matching, same shape as
+        _fold_continuity above: at most TRIP_MATCH_CHUNK_S of backlog per tick,
+        a small rewind rather than a full rebuild, populating live_trip_match
+        for anything QualityService / an API consumer wants "is this trip
+        scheduled" for, without recomputing that match inline on every read.
+        """
+        mark = self.repo.meta_get(TRIP_MATCH_WATERMARK_KEY)
+        since = max(0, int(mark) - TRIP_MATCH_REWIND_S) if mark else max(
+            0, newest - settings.history_retention_hours * 3600)
+        if since >= newest:
+            return {"since": since, "until": since, "matched": 0, "chunked": False}
+
+        until = min(since + TRIP_MATCH_CHUNK_S, newest)
+        live_trips = self.repo.distinct_live_trip_keys(since, until)
+        if live_trips:
+            now = int(time.time())
+            rows = []
+            for lt in live_trips:
+                result = self._trip_matcher.match(lt["route_id"], lt["trip_id"])
+                rows.append({
+                    "live_trip_id": lt["trip_id"], "vehicle_id": lt["vehicle_id"],
+                    "route_id": lt["route_id"], "matched_trip_id": result.matched_trip_id,
+                    "match_type": result.match_type, "delta_minutes": result.delta_minutes,
+                    "matched_at": now,
+                })
+            self.repo.upsert_trip_matches(rows)
+        self.repo.meta_set(TRIP_MATCH_WATERMARK_KEY, str(int(until)))
+        return {"since": since, "until": until, "matched": len(live_trips),
+                "chunked": until < newest}
 
     def _fold_continuity(self, newest: int) -> Dict[str, Any]:
         """One bounded step of the continuity rollup: at most
@@ -166,11 +214,13 @@ class Aggregator:
     def status(self) -> Dict[str, Any]:
         mark = self.repo.meta_get(WATERMARK_KEY)
         continuity_mark = self.repo.meta_get(CONTINUITY_WATERMARK_KEY)
+        trip_match_mark = self.repo.meta_get(TRIP_MATCH_WATERMARK_KEY)
         return {
             "grid_m": int(GRID_M),
             "interval_s": self.interval_s,
             "watermark_ts": int(mark) if mark else None,
             "continuity_watermark_ts": int(continuity_mark) if continuity_mark else None,
+            "trip_match_watermark_ts": int(trip_match_mark) if trip_match_mark else None,
             "last_run": self.last_run,
             "retention_hours": settings.history_retention_hours,
         }

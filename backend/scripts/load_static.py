@@ -58,6 +58,22 @@ def hhmmss_to_seconds(v):
         return None
 
 
+# gtfs_routes and gtfs_trips are the only static tables a foreign key ever
+# points at (fk_vp_route on every rt_vehicle_position partition, and
+# live_trip_match.matched_trip_id) - see schema_postgres.sql. TRUNCATE-ing
+# either one is refused outright by Postgres the moment that FK exists, so
+# on the postgres backend these two are refreshed by upsert-and-prune instead
+# (see load_table_postgres): every row in the new feed is upserted in place
+# rather than dropped and recreated, and only rows that genuinely disappeared
+# from the feed are deleted - which still goes through the FK exactly as
+# intended (blocked if real vehicle history still points at it, cleared to
+# NULL if only a stale trip-match annotation does). Everything else keeps
+# the plain TRUNCATE + reload path.
+POSTGRES_UPSERT_PK = {
+    "gtfs_routes": "route_id",
+    "gtfs_trips": "trip_id",
+}
+
 # One place both backends read: (feed file, table, columns, row -> tuple, label).
 # Column lists deliberately exclude the generated `geom` columns on the
 # Postgres side - they populate themselves from lat/lon.
@@ -173,12 +189,12 @@ def load_table_postgres(conn, path, table, columns, transform, label):
         return 0
     started = time.time()
     collist = ",".join(columns)
+    pk_col = POSTGRES_UPSERT_PK.get(table)
     with conn.transaction():
         # Stage into a constraint-free copy of just the plain columns (no PK,
         # no geom), COPY the file in, then move it across with ON CONFLICT so a
         # duplicate primary key in the feed is dropped rather than aborting -
         # the SQLite path gets the same effect from INSERT OR REPLACE.
-        conn.execute("TRUNCATE " + table)
         conn.execute("CREATE TEMP TABLE _stg AS SELECT " + collist +
                      " FROM " + table + " WITH NO DATA")
         with conn.cursor() as cur:
@@ -187,8 +203,30 @@ def load_table_postgres(conn, path, table, columns, transform, label):
                 for rec in _rows(path, transform):
                     copy.write_row(rec)
                     n += 1
-        conn.execute("INSERT INTO " + table + " (" + collist + ") "
-                     "SELECT " + collist + " FROM _stg ON CONFLICT DO NOTHING")
+        if pk_col:
+            # Upsert-and-prune: TRUNCATE is refused while fk_vp_route or
+            # live_trip_match.matched_trip_id points at this table (see
+            # POSTGRES_UPSERT_PK above). Every row in the new feed replaces
+            # its old values in place; rows no longer in the feed are deleted,
+            # which still enforces the FK exactly as intended.
+            update_cols = [c for c in columns if c != pk_col]
+            set_clause = ",".join(c + " = EXCLUDED." + c for c in update_cols)
+            # DISTINCT ON: unlike ON CONFLICT DO NOTHING (used below for the
+            # unreferenced tables), DO UPDATE raises "cannot affect row a
+            # second time" if the source set has a duplicate pk - so a
+            # duplicate row in the feed must be collapsed before the upsert
+            # to keep the original "dropped rather than aborted" behavior.
+            conn.execute(
+                "INSERT INTO " + table + " (" + collist + ") "
+                "SELECT DISTINCT ON (" + pk_col + ") " + collist + " FROM _stg "
+                "ON CONFLICT (" + pk_col + ") DO UPDATE SET " + set_clause)
+            conn.execute(
+                "DELETE FROM " + table + " WHERE " + pk_col + " NOT IN "
+                "(SELECT " + pk_col + " FROM _stg)")
+        else:
+            conn.execute("TRUNCATE " + table)
+            conn.execute("INSERT INTO " + table + " (" + collist + ") "
+                         "SELECT " + collist + " FROM _stg ON CONFLICT DO NOTHING")
         conn.execute("DROP TABLE _stg")
     print("  - {0:<16} {1:>9,} rows  ({2:.1f}s)".format(label, n, time.time() - started))
     return n

@@ -92,6 +92,10 @@ CREATE TABLE IF NOT EXISTS rt_vehicle_position (
 CREATE INDEX IF NOT EXISTS ix_vp_ts       ON rt_vehicle_position(ts);
 CREATE INDEX IF NOT EXISTS ix_vp_route_ts ON rt_vehicle_position(route_id, ts);
 CREATE INDEX IF NOT EXISTS ix_vp_ingested ON rt_vehicle_position(ingested_at);
+-- Serves distinct_live_trip_keys()'s per-(route_id, trip_id) max(ts) lookup
+-- (Aggregator._match_new_trips, every 6h) - see schema_postgres.sql's comment
+-- on ix_vp_route_trip_ts for why this matters.
+CREATE INDEX IF NOT EXISTS ix_vp_route_trip_ts ON rt_vehicle_position(route_id, trip_id, ts DESC);
 
 -- Current-state projection: exactly one row per vehicle, upserted each poll.
 -- Keeps the hot "what is on the map right now" read off the history table.
@@ -230,3 +234,21 @@ CREATE TABLE IF NOT EXISTS analytics_continuity_hour (
 -- The continuity fold above tracks its own, separate watermark under
 -- 'continuity_watermark_ts' - it must never rewind (see comment above),
 -- so it cannot share the grid/route watermark's rewind-on-restart behaviour.
+
+-- Derived relationship between a live trip and the static timetable - see
+-- schema_postgres.sql's comment on this same table for why it's derived
+-- rather than a FOREIGN KEY on rt_vehicle_position.trip_id directly.
+CREATE TABLE IF NOT EXISTS live_trip_match (
+    live_trip_id    TEXT    PRIMARY KEY,
+    vehicle_id      TEXT    NOT NULL,
+    route_id        TEXT    NOT NULL,
+    matched_trip_id TEXT,
+    match_type      TEXT    NOT NULL CHECK (match_type IN ('strict', 'relaxed', 'none')),
+    delta_minutes   REAL,
+    matched_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_ltm_vehicle    ON live_trip_match(vehicle_id);
+CREATE INDEX IF NOT EXISTS ix_ltm_route      ON live_trip_match(route_id);
+CREATE INDEX IF NOT EXISTS ix_ltm_match_type ON live_trip_match(match_type);
+CREATE INDEX IF NOT EXISTS ix_ltm_matched_at ON live_trip_match(matched_at);
+-- Watermark: meta key 'trip_match_watermark_ts'.

@@ -202,7 +202,11 @@ if _PG_OK:
                   "rt_vehicle_latest", "rt_poll_log", "meta",
                   "analytics_grid_hour", "analytics_route_hour",
                   "analytics_continuity_hour", "analytics_vehicle_gap_state",
-                  "analytics_trip_gap_state")
+                  "analytics_trip_gap_state",
+                  # References gtfs_trips (matched_trip_id) - must be listed
+                  # so TRUNCATE doesn't refuse to truncate gtfs_trips out from
+                  # under it.
+                  "live_trip_match")
 
     def _seed_postgres():
         with pg.pool().connection() as conn:
