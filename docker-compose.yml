@@ -114,7 +114,14 @@ services:
   # same Postgres, keeping 72h. Same image as `api`, different command. Behind
   # the `bmtc` profile so a plain `up` never starts it:
   #   docker compose --profile postgres --profile bmtc up -d --no-deps bmtc-collector
-  # Needs BMTC_AUTH_TOKEN in .env and DB_BACKEND=postgres (SQLite unsupported).
+  # Needs BMTC_AUTH_TOKEN in the repo-root .env (or the shell) and the
+  # Postgres `db` service; SQLite is unsupported.
+  #
+  # Settings come through `environment:` interpolation, not `env_file:` -
+  # the `path:/required:` env_file form needs Compose >= 2.24, and the
+  # deployment host runs 2.21. Every value has a default, so none can resolve
+  # to an empty string except the token; the collector exits at start, with
+  # "BMTC_AUTH_TOKEN is not set" in its log, when that is missing.
   bmtc-collector:
     build:
       context: ./backend
@@ -125,12 +132,12 @@ services:
       db:
         condition: service_healthy
         required: false
-    env_file:
-      - path: ./backend/.env
-        required: false
-      - path: ./.env
-        required: false
     environment:
+      BMTC_AUTH_TOKEN: ${BMTC_AUTH_TOKEN:-}
+      BMTC_POLL_SECONDS: ${BMTC_POLL_SECONDS:-10}
+      BMTC_TRIP_POLL_SECONDS: ${BMTC_TRIP_POLL_SECONDS:-60}
+      BMTC_STATIC_EVERY_HOURS: ${BMTC_STATIC_EVERY_HOURS:-72}
+      BMTC_RETENTION_HOURS: ${BMTC_RETENTION_HOURS:-72}
       DATABASE_URL: ${DATABASE_URL:-postgresql://gtfs:gtfs@db:5432/gtfs}
       PG_POOL_MAX: "3"
     # No HTTP server here; the image's API healthcheck would always fail.
