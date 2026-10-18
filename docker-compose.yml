@@ -110,6 +110,36 @@ services:
     # continuously, so cap it. (Anchor defined on the db service above.)
     logging: *logging
 
+  # BMTC collector: polls BMTC's APIs every 10s into the `bmtc` schema of the
+  # same Postgres, keeping 72h. Same image as `api`, different command. Behind
+  # the `bmtc` profile so a plain `up` never starts it:
+  #   docker compose --profile postgres --profile bmtc up -d --no-deps bmtc-collector
+  # Needs BMTC_AUTH_TOKEN in .env and DB_BACKEND=postgres (SQLite unsupported).
+  bmtc-collector:
+    build:
+      context: ./backend
+    image: delhi-gtfs-api:latest
+    profiles: ["bmtc"]
+    command: ["collect-bmtc"]
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
+    env_file:
+      - path: ./backend/.env
+        required: false
+      - path: ./.env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://gtfs:gtfs@db:5432/gtfs}
+      PG_POOL_MAX: "3"
+    # No HTTP server here; the image's API healthcheck would always fail.
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+    stop_grace_period: 20s
+    logging: *logging
+
 
   web:
     build:

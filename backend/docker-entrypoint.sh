@@ -5,6 +5,7 @@
 #            Idempotent: skips when the database already carries the feed,
 #            unless GTFS_FORCE_RELOAD=1.
 #   serve  - run the API and the realtime poller.
+#   collect-bmtc - run the BMTC collector (app/bmtc), Postgres only.
 set -eu
 
 DB_PATH="${DB_PATH:-/data/gtfs.db}"
@@ -46,6 +47,11 @@ case "${1:-serve}" in
     fi
     exec uvicorn app.main:app --host 0.0.0.0 --port "$PORT" \
          --proxy-headers --forwarded-allow-ips='*'
+    ;;
+  collect-bmtc)
+    # BMTC collector: polls BMTC's APIs into the `bmtc` Postgres schema.
+    # Needs DATABASE_URL and BMTC_AUTH_TOKEN; independent of `serve`.
+    exec python -m app.bmtc.collector
     ;;
   *)
     exec "$@"

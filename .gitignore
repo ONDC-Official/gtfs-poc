@@ -11,6 +11,7 @@ delhi_buses_static_gtfs_v1-2/
 data/*.db
 data/*.db-wal
 data/*.db-shm
+data/dumps/
 
 .venv/
 __pycache__/

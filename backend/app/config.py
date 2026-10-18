@@ -69,6 +69,20 @@ class Settings(BaseSettings):
     # when they need fresher numbers immediately.
     aggregator_interval_s: int = 6 * 3600
 
+    # ---- BMTC collector (app/bmtc) ---------------------------------------
+    # Separate process (`collect-bmtc`), separate `bmtc` schema in the same
+    # Postgres. Inert unless that command runs; the DTC API never reads these.
+    bmtc_auth_token: Optional[str] = None
+    bmtc_base_url: str = "https://bmtchelpdeskapi.karnataka.gov.in/GTFSDataFeed"
+    bmtc_poll_seconds: int = 10
+    bmtc_trip_poll_seconds: int = 60
+    bmtc_static_every_hours: int = 72
+    bmtc_retention_hours: int = 72
+    bmtc_timeout_seconds: float = 8.0
+    # The feed writes vehicle timestamps as IST wall-clock passed off as UTC
+    # epoch seconds (header.timestamp is correct). Subtracted on ingest.
+    bmtc_ts_offset_s: int = 19800
+
     # ---- service ----------------------------------------------------------
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
