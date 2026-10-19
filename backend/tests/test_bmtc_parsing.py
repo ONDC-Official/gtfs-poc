@@ -2,8 +2,7 @@
 real API (18 Oct 2026). Pure functions - no database or network."""
 from datetime import date, datetime, timezone
 
-from app.bmtc.collector import (parse_envelope, parse_static_csv,
-                                parse_trip_updates, parse_vehicles)
+from app.bmtc.collector import parse_envelope, parse_static_csv, parse_vehicles
 
 NOW = datetime(2026, 10, 18, 12, 0, tzinfo=timezone.utc)
 IST = 19800
@@ -93,7 +92,3 @@ def test_static_quoted_commas_header_only_and_unknown_columns():
     _, rows, warns = parse_static_csv(3, ["route_id,service_id,trip_id,shape_id",
                                           "1,weekday_service,9,S1"])
     assert rows[0]["trip_id"] == "9" and any("shape_id" in w for w in warns)
-
-
-def test_trip_updates_empty_feed():
-    assert parse_trip_updates({"header": {"timestamp": None}, "entity": []}) == []

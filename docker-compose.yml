@@ -110,34 +110,41 @@ services:
     # continuously, so cap it. (Anchor defined on the db service above.)
     logging: *logging
 
-  # BMTC collector: polls BMTC's APIs every 10s into the `bmtc` schema of the
-  # same Postgres, keeping 72h. Same image as `api`, different command. Behind
-  # the `bmtc` profile so a plain `up` never starts it:
-  #   docker compose --profile postgres --profile bmtc up -d --no-deps bmtc-collector
+  # BMTC collectors: poll BMTC's APIs into the `bmtc` schema of the same
+  # Postgres, keeping 72h. Behind the `bmtc` profile so a plain `up` never
+  # starts them:
+  #   docker compose --profile postgres --profile bmtc up -d --no-deps bmtc-collector bmtc-trip-collector
   # Needs BMTC_AUTH_TOKEN in the repo-root .env (or the shell) and the
   # Postgres `db` service; SQLite is unsupported.
+  #
+  # Same Dockerfile as `api`, but their own image tag, so building them never
+  # changes the image DTC's api/loader start from.
   #
   # Settings come through `environment:` interpolation, not `env_file:` -
   # the `path:/required:` env_file form needs Compose >= 2.24, and the
   # deployment host runs 2.21. Every value has a default, so none can resolve
-  # to an empty string except the token; the collector exits at start, with
-  # "BMTC_AUTH_TOKEN is not set" in its log, when that is missing.
+  # to an empty string except the token; the collectors exit at start, with
+  # "BMTC_AUTH_TOKEN is not set" in their log, when that is missing.
+
+  # Vehicle positions every 10s, static files every 72h.
   bmtc-collector:
     build:
       context: ./backend
-    image: delhi-gtfs-api:latest
+    image: bmtc-collector:latest
     profiles: ["bmtc"]
     command: ["collect-bmtc"]
     depends_on:
       db:
         condition: service_healthy
         required: false
-    environment:
+    environment: &bmtc-env
       BMTC_AUTH_TOKEN: ${BMTC_AUTH_TOKEN:-}
       BMTC_POLL_SECONDS: ${BMTC_POLL_SECONDS:-10}
-      BMTC_TRIP_POLL_SECONDS: ${BMTC_TRIP_POLL_SECONDS:-60}
       BMTC_STATIC_EVERY_HOURS: ${BMTC_STATIC_EVERY_HOURS:-72}
       BMTC_RETENTION_HOURS: ${BMTC_RETENTION_HOURS:-72}
+      BMTC_TRIP_POLL_MINUTES: ${BMTC_TRIP_POLL_MINUTES:-15}
+      BMTC_STOP_TIMES_EVERY_HOURS: ${BMTC_STOP_TIMES_EVERY_HOURS:-72}
+      BMTC_MIN_FREE_GB: ${BMTC_MIN_FREE_GB:-8}
       DATABASE_URL: ${DATABASE_URL:-postgresql://gtfs:gtfs@db:5432/gtfs}
       PG_POOL_MAX: "3"
     # No HTTP server here; the image's API healthcheck would always fail.
@@ -145,6 +152,28 @@ services:
       disable: true
     restart: unless-stopped
     stop_grace_period: 20s
+    logging: *logging
+
+  # Trip updates every 15 min and stop_times every 72h, zone by zone. A round
+  # is ~256 MB over ~5 min, so it has its own process (never delays the 10s
+  # vehicle polls) and hard caps, so a bad round cannot starve the host.
+  bmtc-trip-collector:
+    image: bmtc-collector:latest
+    profiles: ["bmtc"]
+    command: ["collect-bmtc-trips"]
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
+    environment:
+      <<: *bmtc-env
+      PG_POOL_MAX: "2"
+    cpus: 0.5
+    mem_limit: 1536m
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+    stop_grace_period: 30s
     logging: *logging
 
 

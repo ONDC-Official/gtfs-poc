@@ -6,6 +6,7 @@
 #            unless GTFS_FORCE_RELOAD=1.
 #   serve  - run the API and the realtime poller.
 #   collect-bmtc - run the BMTC collector (app/bmtc), Postgres only.
+#   collect-bmtc-trips - run the BMTC trip collector (app/bmtc/trips.py).
 set -eu
 
 DB_PATH="${DB_PATH:-/data/gtfs.db}"
@@ -52,6 +53,11 @@ case "${1:-serve}" in
     # BMTC collector: polls BMTC's APIs into the `bmtc` Postgres schema.
     # Needs DATABASE_URL and BMTC_AUTH_TOKEN; independent of `serve`.
     exec python -m app.bmtc.collector
+    ;;
+  collect-bmtc-trips)
+    # BMTC trip collector: zone-wise trip updates (15 min) and stop_times
+    # (72h) into the same `bmtc` schema. Runs beside collect-bmtc.
+    exec python -m app.bmtc.trips
     ;;
   *)
     exec "$@"

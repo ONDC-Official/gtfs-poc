@@ -15,11 +15,11 @@ Feed quirks handled here (see docs on the BMTC API test findings):
 """
 import csv
 
-import json
 import logging
 import re
 import signal
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,6 +32,9 @@ from ..data import pg
 log = logging.getLogger("gtfs.bmtc")
 
 _SCHEMA = Path(__file__).resolve().parents[1] / "data" / "schema_bmtc.sql"
+_HOUR = timedelta(hours=1)
+# Hourly partitions this process has created or found; see store_vehicles.
+_known_hours: set = set()
 
 VEHICLE_EP = "GetGTFSVehicleUpdateData"
 TRIP_EP = "GetGTFSTripsUpdateData"
@@ -185,32 +188,6 @@ def parse_vehicles(data: Any, now: datetime, offset_s: int,
     return list(by_vehicle.values()), header_ts, stale
 
 
-def parse_trip_updates(data: Any) -> List[Dict[str, Any]]:
-    data = data if isinstance(data, dict) else {}
-    out = []
-    for ent in data.get("entity") or []:
-        tu = (ent or {}).get("trip_update") or (ent or {}).get("tripUpdate") or {}
-        trip = tu.get("trip") or {}
-        trip_id = _s(trip.get("trip_id") or trip.get("tripId"))
-        ts = _epoch(tu.get("timestamp")) or _epoch((data.get("header") or {}).get("timestamp"))
-        if trip_id is None or ts is None:
-            continue
-        out.append({
-            "trip_id": trip_id,
-            "update_ts": ts,
-            "route_id": _s(trip.get("route_id") or trip.get("routeId")),
-            "start_time": _s(trip.get("start_time") or trip.get("startTime")),
-            "start_date": _yyyymmdd(trip.get("start_date") or trip.get("startDate")),
-            "schedule_relationship": _s(trip.get("schedule_relationship")
-                                        or trip.get("scheduleRelationship")),
-            "vehicle_id": _s((tu.get("vehicle") or {}).get("id")),
-            "delay": _int(tu.get("delay")),
-            "stop_time_updates": json.dumps(tu.get("stop_time_update")
-                                            or tu.get("stopTimeUpdate") or []),
-        })
-    return out
-
-
 _AGENCY_RECORD = re.compile(r"(?<![\d,])(?=\d+,[^,]*,https?://)")
 
 
@@ -260,15 +237,42 @@ def parse_static_csv(check: int, lines: Any) -> Tuple[List[str], List[Dict[str, 
 # Storage
 # ---------------------------------------------------------------------------
 
+# Session limits on every collector connection. Analysis queries on the same
+# tables must never stall collection: a write that cannot get its lock in 5s
+# fails and is retried on the next tick instead of queueing (and, while
+# queued, blocking everyone behind it).
+_SESSION_LIMITS = "SET lock_timeout = '5s'; SET statement_timeout = '90s'"
+
+
+@contextmanager
+def _conn():
+    # Re-applied on every checkout (one cheap round trip): the pool may hand
+    # out a fresh connection at any time, and init_schema resets its own.
+    with pg.pool().connection() as conn:
+        conn.execute(_SESSION_LIMITS)
+        yield conn
+
+
+# Both BMTC collectors apply the schema at start; the advisory lock keeps two
+# containers starting together from racing on CREATE OR REPLACE FUNCTION.
+_SCHEMA_LOCK = 0x626d7463  # 'bmtc'
+
+
 def init_schema() -> None:
     with pg.pool().connection() as conn:
-        conn.execute(_SCHEMA.read_text())
+        conn.execute("SET lock_timeout = '60s'")
+        conn.execute("SELECT pg_advisory_lock(%s)", (_SCHEMA_LOCK,))
+        try:
+            conn.execute(_SCHEMA.read_text())
+        finally:
+            conn.execute("SELECT pg_advisory_unlock(%s)", (_SCHEMA_LOCK,))
+            conn.execute("RESET lock_timeout")
     log.info("bmtc schema ready")
 
 
 def log_poll(endpoint: str, **f: Any) -> int:
     cols = ["endpoint"] + list(f)
-    with pg.pool().connection() as conn:
+    with _conn() as conn:
         return conn.execute(
             f"INSERT INTO bmtc.poll_log ({','.join(cols)}) "
             f"VALUES ({','.join(['%s'] * len(cols))}) RETURNING poll_id",
@@ -295,10 +299,14 @@ def store_vehicles(rows: List[Dict[str, Any]], poll_id: int, now: datetime) -> i
         r["poll_id"], r["ingested_at"] = poll_id, now
     hours = {r["ts"].replace(minute=0, second=0, microsecond=0) for r in rows
              if r["ts"] <= now.replace(microsecond=0) + _HOUR}
+    # Creating a partition locks the parent table, so only attempt hours not
+    # already seen; in steady state that is one attempt per new hour, not one
+    # per hour-in-batch every 10s (which queued behind long analysis reads).
+    missing = hours - _known_hours
     unnest = ", ".join(f"%s::{t}[]" for t in _VP_TYPES)
-    with pg.pool().connection() as conn:
+    with _conn() as conn:
         with conn.transaction():
-            for h in hours:
+            for h in sorted(missing):
                 conn.execute("SELECT bmtc.ensure_hour_partition(%s)", (h,))
             new = conn.execute(
                 f"INSERT INTO bmtc.vehicle_position ({','.join(_VP_COLS)}) "
@@ -323,27 +331,14 @@ def store_vehicles(rows: List[Dict[str, Any]], poll_id: int, now: datetime) -> i
                 "label = COALESCE(EXCLUDED.label, bmtc.vehicles.label), "
                 "last_seen = EXCLUDED.last_seen",
                 (now, now, [r["vehicle_id"] for r in rows], [r["label"] for r in rows]))
+    # Only after commit: a rolled-back CREATE must be retried next tick.
+    _known_hours.update(missing)
     return new
-
-
-def store_trip_updates(rows: List[Dict[str, Any]], poll_id: int) -> int:
-    if not rows:
-        return 0
-    cols = ["trip_id", "update_ts", "route_id", "start_time", "start_date",
-            "schedule_relationship", "vehicle_id", "delay", "stop_time_updates"]
-    types = ["text", "timestamptz", "text", "text", "date", "text", "text",
-             "integer", "jsonb"]
-    with pg.pool().connection() as conn:
-        return conn.execute(
-            f"INSERT INTO bmtc.trip_update ({','.join(cols)}, poll_id) "
-            f"SELECT *, %s FROM unnest({', '.join(f'%s::{t}[]' for t in types)}) "
-            "ON CONFLICT (trip_id, update_ts) DO NOTHING",
-            [poll_id, *_arrays(rows, cols)]).rowcount
 
 
 def replace_static(table: str, rows: List[Dict[str, Any]]) -> None:
     cols = list(rows[0])
-    with pg.pool().connection() as conn:
+    with _conn() as conn:
         with conn.transaction():
             conn.execute(f"TRUNCATE bmtc.{table}")
             with conn.cursor().copy(
@@ -354,7 +349,7 @@ def replace_static(table: str, rows: List[Dict[str, Any]]) -> None:
 
 def last_static_pull() -> Optional[datetime]:
     """Time of the last pull in which every file that returned rows loaded."""
-    with pg.pool().connection() as conn:
+    with _conn() as conn:
         row = conn.execute(
             "SELECT max(pulled_at) AS t FROM bmtc.static_pull_log "
             "WHERE check_no = 3 AND row_count > 0").fetchone()
@@ -365,7 +360,7 @@ def apply_retention(now: datetime) -> Dict[str, int]:
     cutoff = now.timestamp() - settings.bmtc_retention_hours * 3600
     cut = datetime.fromtimestamp(cutoff, tz=timezone.utc)
     out = {}
-    with pg.pool().connection() as conn:
+    with _conn() as conn:
         with conn.transaction():
             out["partitions_dropped"] = conn.execute(
                 "SELECT bmtc.drop_old_partitions(%s) AS n", (cut,)).fetchone()["n"]
@@ -394,10 +389,10 @@ def apply_retention(now: datetime) -> Dict[str, int]:
 # Collector
 # ---------------------------------------------------------------------------
 
-_HOUR = timedelta(hours=1)
+class BmtcClient:
+    """POSTs to BMTC's GTFSDataFeed with the auth headers it requires.
+    Shared by the vehicle collector and the trip collector (trips.py)."""
 
-
-class Collector:
     def __init__(self) -> None:
         if not settings.bmtc_auth_token:
             raise SystemExit("BMTC_AUTH_TOKEN is not set")
@@ -406,12 +401,8 @@ class Collector:
             timeout=settings.bmtc_timeout_seconds,
             headers={"authToken": settings.bmtc_auth_token,
                      "Content-Type": "application/json"})
-        self.stopping = False
-        self.next_trip = 0.0
-        self.next_retention = 0.0
-        self.next_static_check = 0.0
 
-    def _post(self, ep: str, body: Dict[str, Any], timeout: Optional[float] = None):
+    def post(self, ep: str, body: Dict[str, Any], timeout: Optional[float] = None):
         """-> (http_status, ok, Data, error, latency_ms)."""
         t0 = time.perf_counter()
         try:
@@ -427,9 +418,24 @@ class Collector:
         ok, data, err = parse_envelope(body_json)
         return r.status_code, ok, data, err, ms
 
+    def close(self) -> None:
+        self.http.close()
+
+
+class Collector:
+    """Vehicle positions every 10s, static files 0-3 and 5 every 72h, and
+    retention for the tables it writes. Trip updates and stop_times (check 4,
+    zone-wise) belong to the trip collector."""
+
+    def __init__(self) -> None:
+        self.client = BmtcClient()
+        self.stopping = False
+        self.next_retention = 0.0
+        self.next_static_check = 0.0
+
     def poll_vehicles(self) -> None:
         now = datetime.now(timezone.utc)
-        status, ok, data, err, ms = self._post(VEHICLE_EP, {})
+        status, ok, data, err, ms = self.client.post(VEHICLE_EP, {})
         rows, header_ts, stale = ([], None, 0)
         if ok:
             rows, header_ts, stale = parse_vehicles(
@@ -445,7 +451,7 @@ class Collector:
             except Exception as exc:
                 log.exception("store failed")
                 err = f"store failed: {exc}"[:500]
-        with pg.pool().connection() as conn:
+        with _conn() as conn:
             conn.execute("UPDATE bmtc.poll_log SET new_rows=%s, duplicates=%s, "
                          "error=coalesce(%s, error) WHERE poll_id=%s",
                          (new, len(rows) - new, err if rows else None, poll_id))
@@ -453,25 +459,15 @@ class Collector:
                  status, ok, entities, new, len(rows) - new, stale, ms,
                  f" | {err}" if err else "")
 
-    def poll_trip_updates(self) -> None:
-        status, ok, data, err, ms = self._post(TRIP_EP, {})
-        rows = parse_trip_updates(data) if ok else []
-        header_ts = _epoch(((data or {}).get("header") or {}).get("timestamp")) if ok else None
-        entities = len((data or {}).get("entity") or []) if ok else None
-        poll_id = log_poll("trip_update", http_status=status, is_success=ok,
-                           error=err, header_ts=header_ts, entities=entities,
-                           latency_ms=ms)
-        new = store_trip_updates(rows, poll_id)
-        if new or not ok:
-            log.info("trip updates | http=%s ok=%s entities=%s new=%s%s",
-                     status, ok, entities, new, f" | {err}" if err else "")
-
     def pull_static(self) -> bool:
-        """Fetch checks 0-5. A file that fails or comes back empty keeps its
-        previous contents. Returns True when trips loaded (the timer anchor)."""
+        """Fetch checks 0-3 and 5. A file that fails or comes back empty keeps
+        its previous contents. Returns True when trips loaded (the timer
+        anchor). Check 4 (stop_times) is zone-wise and pulled by trips.py."""
         trips_ok = False
         for check, (name, table, _) in STATIC_FILES.items():
-            status, ok, data, err, _ms = self._post(STATIC_EP, {"check": check}, timeout=60)
+            if check == 4:
+                continue
+            status, ok, data, err, _ms = self.client.post(STATIC_EP, {"check": check}, timeout=60)
             n, warns = 0, [err] if err else []
             if ok:
                 _, rows, w = parse_static_csv(check, data)
@@ -485,7 +481,7 @@ class Collector:
                         warns.append(f"load failed: {exc}"[:300])
                 else:
                     warns.append("empty - previous contents kept")
-            with pg.pool().connection() as conn:
+            with _conn() as conn:
                 conn.execute(
                     "INSERT INTO bmtc.static_pull_log (check_no, file_name, http_status, "
                     "row_count, warnings) VALUES (%s,%s,%s,%s,%s)",
@@ -511,9 +507,9 @@ class Collector:
         signal.signal(signal.SIGTERM, self._stop)
         signal.signal(signal.SIGINT, self._stop)
         init_schema()
-        log.info("bmtc collector started | vehicles every %ss, trips every %ss, "
+        log.info("bmtc collector started | vehicles every %ss, "
                  "static every %sh, retention %sh",
-                 settings.bmtc_poll_seconds, settings.bmtc_trip_poll_seconds,
+                 settings.bmtc_poll_seconds,
                  settings.bmtc_static_every_hours, settings.bmtc_retention_hours)
         period = settings.bmtc_poll_seconds
         next_tick = time.monotonic()
@@ -535,14 +531,11 @@ class Collector:
                 next_tick += skipped * period
             while not self.stopping and time.monotonic() < next_tick:
                 time.sleep(min(0.5, next_tick - time.monotonic()))
-        self.http.close()
+        self.client.close()
         pg.close()
         log.info("bmtc collector stopped")
 
     def _side_jobs(self, mono: float) -> None:
-        if mono >= self.next_trip:
-            self.next_trip = mono + settings.bmtc_trip_poll_seconds
-            self.poll_trip_updates()
         self._maybe_static(mono)
         if mono >= self.next_retention:
             self.next_retention = mono + 3600

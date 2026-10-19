@@ -114,9 +114,12 @@ CREATE TABLE IF NOT EXISTS bmtc.trips (
     trip_id text PRIMARY KEY, route_id text, service_id text);
 CREATE INDEX IF NOT EXISTS ix_bmtc_trips_route ON bmtc.trips (route_id);
 
+-- stop_sequence is bigint: BMTC sends global ids (e.g. 2445505881), not 1..n.
+-- Pulled zone-wise (zoneid 1-7) by the trip collector.
 CREATE TABLE IF NOT EXISTS bmtc.stop_times (
-    trip_id text NOT NULL, stop_sequence integer NOT NULL,
+    trip_id text NOT NULL, stop_sequence bigint NOT NULL,
     arrival_time text, departure_time text, stop_id text,
+    zone_id smallint,
     PRIMARY KEY (trip_id, stop_sequence));
 
 CREATE TABLE IF NOT EXISTS bmtc.calendar (
@@ -149,6 +152,11 @@ DECLARE
     part    text := 'vehicle_position_' ||
                     to_char(h_start AT TIME ZONE 'UTC', 'YYYYMMDD_HH24');
 BEGIN
+    -- Catalog lookup first: CREATE ... PARTITION OF locks the parent, which
+    -- would queue behind any long read even when the partition exists.
+    IF to_regclass('bmtc.' || part) IS NOT NULL THEN
+        RETURN;
+    END IF;
     EXECUTE format(
         'CREATE TABLE bmtc.%I PARTITION OF bmtc.vehicle_position FOR VALUES FROM (%L) TO (%L)',
         part, h_start, h_start + interval '1 hour');
@@ -188,3 +196,98 @@ BEGIN
     RETURN dropped;
 END;
 $$;
+
+-- --------------------------------------------------------------------------
+-- Trip data (trip collector, app/bmtc/trips.py). Added after the first
+-- deployment, so everything below is additive: new tables, new nullable
+-- columns, and a type change on stop_times while it is still empty.
+-- --------------------------------------------------------------------------
+
+ALTER TABLE bmtc.poll_log ADD COLUMN IF NOT EXISTS zone_id smallint;
+ALTER TABLE bmtc.poll_log ADD COLUMN IF NOT EXISTS changed_rows integer;
+ALTER TABLE bmtc.static_pull_log ADD COLUMN IF NOT EXISTS zone_id smallint;
+ALTER TABLE bmtc.stop_times ADD COLUMN IF NOT EXISTS zone_id smallint;
+DO $$
+BEGIN
+    IF (SELECT data_type FROM information_schema.columns
+        WHERE table_schema = 'bmtc' AND table_name = 'stop_times'
+          AND column_name = 'stop_sequence') = 'integer' THEN
+        ALTER TABLE bmtc.stop_times ALTER COLUMN stop_sequence TYPE bigint;
+    END IF;
+END $$;
+
+-- One row per trip per service day: did it run, was it canceled, how late.
+CREATE TABLE IF NOT EXISTS bmtc.trip_status (
+    service_date     date        NOT NULL,   -- trip start_date (DDMMYYYY in this feed)
+    trip_id          text        NOT NULL,
+    zone_id          smallint,
+    route_id         text,
+    start_time       text,
+    status           text,                   -- SCHEDULED | UNSCHEDULED | CANCELED
+    stops_total      integer,
+    stops_skipped    integer,
+    stops_with_delay integer,
+    max_delay_s      integer,                -- largest plausible arrival delay
+    first_seen       timestamptz NOT NULL,
+    last_seen        timestamptz NOT NULL,   -- last round the trip was in the feed
+    canceled_at      timestamptz,            -- first round it was CANCELED
+    poll_id          bigint,
+    PRIMARY KEY (service_date, trip_id)
+);
+CREATE INDEX IF NOT EXISTS ix_bmtc_ts_route ON bmtc.trip_status (service_date, route_id);
+CREATE INDEX IF NOT EXISTS ix_bmtc_ts_zone  ON bmtc.trip_status (service_date, zone_id);
+
+-- Latest delay of each trip at each stop, per service day. The feed repeats
+-- past stops in every round, so the last value written is the delay the bus
+-- actually had there. Partitioned by service day so retention is DROP TABLE.
+CREATE TABLE IF NOT EXISTS bmtc.stop_delay (
+    service_date      date        NOT NULL,
+    trip_id           text        NOT NULL,
+    stop_sequence     bigint      NOT NULL,
+    stop_id           text,
+    arrival_delay_s   integer,               -- NULL: feed sent no delay
+    departure_delay_s integer,
+    stop_status       text,                  -- SCHEDULED | UNSCHEDULED | SKIPPED
+    implausible       boolean,               -- |delay| > 2h; kept, not dropped
+    changes           smallint    NOT NULL DEFAULT 0,
+    first_seen        timestamptz NOT NULL,
+    last_seen         timestamptz NOT NULL,  -- last round the values changed
+    PRIMARY KEY (service_date, trip_id, stop_sequence)
+) PARTITION BY RANGE (service_date);
+CREATE TABLE IF NOT EXISTS bmtc.stop_delay_default
+    PARTITION OF bmtc.stop_delay DEFAULT;
+CREATE INDEX IF NOT EXISTS ix_bmtc_sd_stop ON bmtc.stop_delay (service_date, stop_id);
+
+CREATE OR REPLACE FUNCTION bmtc.ensure_day_partition(p_day date)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    part text := 'stop_delay_' || to_char(p_day, 'YYYYMMDD');
+BEGIN
+    IF to_regclass('bmtc.' || part) IS NOT NULL THEN
+        RETURN;
+    END IF;
+    EXECUTE format(
+        'CREATE TABLE bmtc.%I PARTITION OF bmtc.stop_delay FOR VALUES FROM (%L) TO (%L)',
+        part, p_day, p_day + 1);
+EXCEPTION
+    WHEN duplicate_table THEN NULL;
+    WHEN invalid_object_definition THEN NULL;
+    WHEN check_violation THEN NULL;
+END;
+$$;
+
+-- Per IST day, per endpoint and zone: how many calls ran and succeeded. A day
+-- or zone with no row was not collected - this is where "missing" shows up.
+-- Expected per full day: vehicle 8640 calls; trip_update 96 per zone (15 min).
+CREATE OR REPLACE VIEW bmtc.data_coverage AS
+SELECT (polled_at AT TIME ZONE 'Asia/Kolkata')::date AS day_ist,
+       endpoint,
+       zone_id,
+       count(*)                              AS calls,
+       count(*) FILTER (WHERE is_success)    AS ok_calls,
+       min(polled_at)                        AS first_call,
+       max(polled_at)                        AS last_call,
+       sum(new_rows)                         AS new_rows,
+       sum(changed_rows)                     AS changed_rows
+FROM bmtc.poll_log
+GROUP BY 1, 2, 3;

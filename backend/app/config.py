@@ -75,8 +75,16 @@ class Settings(BaseSettings):
     bmtc_auth_token: Optional[str] = None
     bmtc_base_url: str = "https://bmtchelpdeskapi.karnataka.gov.in/GTFSDataFeed"
     bmtc_poll_seconds: int = 10
-    bmtc_trip_poll_seconds: int = 60
     bmtc_static_every_hours: int = 72
+    # Trip collector (app/bmtc/trips.py, `collect-bmtc-trips`): trip updates
+    # and stop_times are only served per zone (zoneid 1-7). A full trip round
+    # is ~256 MB and ~5 min, hence minutes, not seconds.
+    bmtc_zones: str = "1,2,3,4,5,6,7"
+    bmtc_trip_poll_minutes: int = 15
+    bmtc_trip_timeout_seconds: float = 120.0
+    bmtc_stop_times_every_hours: int = 72
+    # Skip a trip round when the data disk has less free space than this.
+    bmtc_min_free_gb: float = 8.0
     bmtc_retention_hours: int = 72
     bmtc_timeout_seconds: float = 8.0
     # The feed writes vehicle timestamps as IST wall-clock passed off as UTC
