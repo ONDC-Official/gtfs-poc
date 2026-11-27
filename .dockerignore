@@ -9,3 +9,6 @@ frontend/node_modules/
 gtfs-rt.cred
 backend/.env
 .DS_Store
+harness/.harness/
+harness/reports/
+harness/bin/

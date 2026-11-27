@@ -1,0 +1,54 @@
+# TC-6 smoke: the same checks as tc-06-endpoint-baseline at low rate and
+# short duration (about 4 minutes), to prove the harness and the stack work
+# before a long run. Not a performance result.
+scenario_id: tc-06-smoke
+description: >
+  TC-6 smoke run: every TC-6 check at low rate for a few minutes.
+seed: 6
+agency_count: 1
+
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  projector_interval: 5s
+  trip_updates_enabled: false
+
+identities:
+  valid: 5
+  low_quota: 1
+  low_quota_per_min: 10
+  malformed: 1
+  unknown_agency: 1
+
+ready_timeout: 5m
+
+phases:
+  - name: realtime
+    duration: 90s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 10, concurrency: 10, identities: [valid] }
+      - { name: rt-conditional, endpoint: realtime, rps: 2, concurrency: 2, conditional: true, identities: [valid] }
+      - { name: rt-access-failures, endpoint: realtime, rps: 2, concurrency: 4, identities: [low_quota, malformed, unknown_agency] }
+  - name: static
+    duration: 60s
+    profiles:
+      - { name: static, endpoint: static, rps: 2, concurrency: 4, identities: [valid] }
+      - { name: static-conditional, endpoint: static, rps: 1, concurrency: 1, conditional: true, identities: [valid] }
+  - name: mixed-80-20
+    duration: 60s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 8, concurrency: 8, identities: [valid] }
+      - { name: static, endpoint: static, rps: 2, concurrency: 4, identities: [valid] }
+
+acceptance_thresholds:
+  availability_min: 0.99
+  realtime_p95_ms_max: 500
+  realtime_p99_ms_max: 1000
+  static_p95_ms_max: 2000
+  server_error_rate_max: 0.01
+  check_failures_max: 0
+  client_saturated_max: 0
+  projector_lag_s_max: 30
+  data_age_s_max: 60
+  vehicle_collection_success_min: 0.999

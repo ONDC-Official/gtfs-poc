@@ -327,3 +327,23 @@ position history joined to the full schedule. The natural next steps:
   history, which is where PostGIS starts to earn its place.
 - **Move history to a columnar store.** `rt_vehicle_position` grows ~600 rows/poll;
   DuckDB or Timescale behind the same `Repository` port keeps these queries fast.
+
+## Perf harness (`harness/`)
+
+A test harness for the Transit Hub (the BMTC collector and consumer on dev).
+It plays both sides: a **mock BMTC** that the dev collector polls for `MOCK_`
+test agencies, and a **buyer load client** that calls the dev Consumer API.
+
+It lives behind the compose profile `harness`, so a plain
+`docker compose up` never starts it and the demo is unaffected:
+
+```bash
+docker compose --profile harness up -d --build harness-mock   # mock BMTC
+curl -s https://fis-staging.ondc.org/gtfs/mock-agency/_ping     # reachable through both nginx layers
+docker compose --profile harness run --rm harness help
+```
+
+`web`'s nginx publishes only the mock's feed, under `/mock-agency/` (and
+`/gtfs/mock-agency/`); the mock's control API stays on host loopback
+(`HARNESS_CONTROL_PORT`, default `127.0.0.1:19191`). Settings are the
+`HARNESS_*` block in `.env.example`. Details: [harness/README.md](harness/README.md).
