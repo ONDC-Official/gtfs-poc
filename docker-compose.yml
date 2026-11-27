@@ -15,6 +15,13 @@
 #   compose profile, so a plain `up` never touches it and the SQLite path is
 #   byte-for-byte unchanged.
 #
+# Perf harness (harness/, compose profile "harness"):
+#   Mock BMTC + test runner for the Transit Hub perf tests against dev. Never
+#   started by a plain `up`:
+#     docker compose --profile harness up -d --build harness-mock
+#     docker compose --profile harness run --rm harness run /scenarios/dev/<scenario>.yaml
+#   See harness/README.md.
+#
 # Metrics/Grafana:
 #   prometheus is always started (metrics work on either storage backend) and
 #   binds to PROMETHEUS_PORT (default 127.0.0.1:9090) so an existing Grafana
@@ -81,11 +88,13 @@ services:
     # image. Do NOT restate these keys under `environment:` - an unset
     # ${VAR:-} there resolves to an empty string and silently overrides the
     # file, which is how you end up running the mock feed by accident.
+    #
+    # Plain list, not the `path:/required:` form: the deployment host runs
+    # Compose 2.21, which doesn't support it (this matches what the server
+    # has been running). The repo-root .env must exist; put the feed
+    # settings there.
     env_file:
-      - path: ./backend/.env
-        required: false
-      - path: ./.env
-        required: false
+      - .env
     environment:
       # Container paths only. `environment` outranks `env_file`, which is what
       # makes these win over any host-oriented value in a .env.
@@ -176,6 +185,75 @@ services:
     stop_grace_period: 30s
     logging: *logging
 
+  # ---- Perf harness (profile "harness") -----------------------------------
+  # Mock BMTC that the dev Transit Hub collector polls for MOCK_ agencies.
+  # Plain HTTP on the compose network; web's nginx publishes only the feed,
+  # under /mock-agency/ (TLS ends at the host nginx). The control API is on
+  # host loopback only and is never routed through nginx.
+  harness-mock:
+    build:
+      context: ./harness
+    image: gtfs-harness:latest
+    profiles: ["harness"]
+    entrypoint: ["/mockbmtc"]
+    command:
+      - -addr=:9080
+      - -control-addr=:9091
+      - -token=${HARNESS_MOCK_TOKEN:-change-me}
+      - -vehicles=${HARNESS_MOCK_VEHICLES:-7000}
+      # Named agencies (MOCK_nn) and their tokens survive a mock restart.
+      - -state=/state/agencies.json
+    volumes:
+      - harness-state:/state
+    expose:
+      - "9080"
+      - "9091"
+    ports:
+      - "${HARNESS_CONTROL_PORT:-127.0.0.1:19191}:9091"
+    healthcheck:
+      test: ["CMD", "/mockbmtc", "-healthcheck", "http://127.0.0.1:9091/_harness/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    # Shared host: keep the mock from starving its neighbours.
+    cpus: ${HARNESS_MOCK_CPUS:-0.5}
+    mem_limit: ${HARNESS_MOCK_MEM:-768m}
+    restart: unless-stopped
+    stop_grace_period: 10s
+    logging: *logging
+
+  # Test runner. One-shot, never started by `up`:
+  #   docker compose --profile harness run --rm harness status
+  #   docker compose --profile harness run --rm harness run /scenarios/dev/<scenario>.yaml
+  # Settings via environment interpolation (Compose 2.21); every value has a
+  # default except the admin key.
+  harness:
+    image: gtfs-harness:latest
+    profiles: ["harness"]
+    entrypoint: ["/harness"]
+    command: ["help"]
+    depends_on:
+      harness-mock:
+        condition: service_healthy
+    environment:
+      HARNESS_TARGET: dev
+      HARNESS_CONSUMER_URL: ${HARNESS_CONSUMER_URL:-https://gtfs-dev.ondc.tech}
+      HARNESS_MOCK_PUBLIC_URL: ${HARNESS_MOCK_PUBLIC_URL:-https://fis-staging.ondc.org/gtfs/mock-agency}
+      HARNESS_MOCK_CONTROL_URL: http://harness-mock:9091
+      HARNESS_ADMIN_API_KEY: ${HARNESS_ADMIN_API_KEY:-}
+      HARNESS_MAX_MBIT: ${HARNESS_MAX_MBIT:-50}
+      HARNESS_FAULTS_ALLOWED: ${HARNESS_FAULTS_ALLOWED:-false}
+      HARNESS_ALLOWED_HOSTS: ${HARNESS_ALLOWED_HOSTS:-}
+      HARNESS_REPORTS_DIR: /reports
+    volumes:
+      - harness-reports:/reports
+      - ./harness/scenarios:/scenarios:ro
+    cpus: ${HARNESS_CPUS:-1.0}
+    mem_limit: ${HARNESS_MEM:-1g}
+    healthcheck:
+      disable: true
+    restart: "no"
+    logging: *logging
 
   web:
     build:
@@ -215,3 +293,6 @@ volumes:
   pg-data:
   # Prometheus's own TSDB, so scrape history survives a container restart.
   prometheus-data:
+  # Perf harness: mock agencies and their tokens, and run reports.
+  harness-state:
+  harness-reports:

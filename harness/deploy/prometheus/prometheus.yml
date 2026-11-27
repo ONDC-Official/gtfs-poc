@@ -1,0 +1,14 @@
+# Harness Prometheus: scrapes the system under test and the mock every 5 s.
+# Alert rules come from the two service repos (mounted by compose).
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+rule_files:
+  - /etc/prometheus/rules/*.yml
+scrape_configs:
+  - job_name: transit-hub-collector
+    static_configs: [{ targets: ["collector:8080"] }]
+  - job_name: transit-hub-consumer
+    static_configs: [{ targets: ["consumer:8082"] }]
+  - job_name: mockbmtc
+    static_configs: [{ targets: ["mockbmtc:9091"] }]

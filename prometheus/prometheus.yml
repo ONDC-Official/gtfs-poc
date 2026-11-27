@@ -10,3 +10,10 @@ scrape_configs:
     metrics_path: /api/metrics
     static_configs:
       - targets: ["api:8000"]
+
+  # Perf-harness mock BMTC (profile "harness"): requests per endpoint and
+  # outcome, bytes. Shows as down when the harness isn't running; harmless.
+  - job_name: harness-mock
+    scrape_interval: 10s
+    static_configs:
+      - targets: ["harness-mock:9091"]
