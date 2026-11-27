@@ -8,22 +8,39 @@
 //	POST /GetGTFSTripsUpdateData     {"zoneid": 1..7}
 //	POST /GetGTFSStaticData          {"check": 0..7[, "zoneid": 1..7]}
 //
-// Control endpoints (what the harness calls; never exposed to the collector):
+// The same endpoints are served per named agency under /{agency_id}/...
+// (e.g. /MOCK_01/GetGTFSVehicleUpdateData), each with its own token, data
+// settings, faults, static version and stats. The root paths are the
+// default agency (Config.Token), as used by the local stack.
 //
-//	GET|PUT|DELETE /_harness/faults   fault rules (JSON list of faults.Rule)
-//	POST /_harness/static/bump        publish a new static schedule version
-//	GET  /_harness/stats              what was served, as JSON
+// Control endpoints (what the harness calls; never exposed to the collector).
+// Faults, bump and stats take ?agency=<id>; without it they act on the
+// default agency.
+//
+//	GET|PUT|DELETE /_harness/faults        fault rules (JSON list of faults.Rule)
+//	POST /_harness/static/bump             publish a new static schedule version
+//	GET  /_harness/stats                   what was served, as JSON
+//	GET  /_harness/agencies                named agencies (never their tokens)
+//	PUT  /_harness/agencies/{agency_id}    add or replace one: {"token": "...", "vehicles": n, "shift_s": n}
+//	DELETE /_harness/agencies/{agency_id}  remove one
+//	DELETE /_harness/agencies              remove all
 //	GET  /_harness/healthz
-//	GET  /metrics                     the same counters for Prometheus
+//	GET  /metrics                          the same counters for Prometheus (label "agency")
 package mock
 
 import (
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,25 +98,63 @@ func Defaults() Config {
 	}
 }
 
-// Server serves the feed and control endpoints.
-type Server struct {
-	cfg    Config
-	faults *faults.Set
-	log    *slog.Logger
+// DefaultAgency labels the root-path agency in stats and metrics.
+const DefaultAgency = "default"
 
-	seq     atomic.Uint64
+// MaxAgencies bounds the named agencies (the plan ramps to 25).
+const MaxAgencies = 100
+
+var agencyIDPattern = regexp.MustCompile(`^[A-Z0-9_]{1,32}$`)
+
+// AgencySpec is a named agency as set through the control API and saved in
+// the state file.
+type AgencySpec struct {
+	ID       string `json:"agency_id"`
+	Token    string `json:"token"`
+	Vehicles int    `json:"vehicles,omitempty"` // 0: the server's default
+	ShiftS   *int   `json:"shift_s,omitempty"`  // vehicle timestamp shift in seconds; nil: the server's default
+}
+
+// AgencyInfo is a named agency as listed by the control API (no token).
+type AgencyInfo struct {
+	ID            string    `json:"agency_id"`
+	TokenSet      bool      `json:"token_set"`
+	Vehicles      int       `json:"vehicles"`
+	ShiftS        int       `json:"shift_s"`
+	StaticVersion int64     `json:"static_version"`
+	AddedAt       time.Time `json:"added_at"`
+}
+
+// agency is one feed: the default (root paths) or a named one.
+type agency struct {
+	id      string
+	cfg     Config // the server's config with this agency's overrides
+	faults  *faults.Set
 	version atomic.Int64
+	added   time.Time
 
 	staticMu    sync.Mutex
 	staticCache map[int64]map[string]string
 
-	requests *prometheus.CounterVec // endpoint, outcome
-	bytes    *prometheus.CounterVec // endpoint
-	entities *prometheus.CounterVec // endpoint
-	registry *prometheus.Registry
-
 	statsMu sync.Mutex
 	stats   map[string]*EndpointStats
+}
+
+// Server serves the feed and control endpoints.
+type Server struct {
+	cfg Config
+	log *slog.Logger
+	seq atomic.Uint64
+
+	def       *agency
+	mu        sync.RWMutex
+	agencies  map[string]*agency
+	statePath string // "" keeps named agencies in memory only
+
+	requests *prometheus.CounterVec // agency, endpoint, outcome
+	bytes    *prometheus.CounterVec // agency, endpoint
+	entities *prometheus.CounterVec // agency, endpoint
+	registry *prometheus.Registry
 }
 
 // EndpointStats is what one endpoint has served.
@@ -122,32 +177,157 @@ func New(cfg Config, log *slog.Logger) *Server {
 	if cfg.Static.Stops == 0 {
 		cfg.Static = d.Static
 	}
-	s := &Server{
-		cfg: cfg, faults: faults.NewSet(cfg.Seed), log: log,
-		staticCache: map[int64]map[string]string{},
-		stats:       map[string]*EndpointStats{},
-		registry:    prometheus.NewRegistry(),
-	}
-	s.version.Store(int64(max(cfg.Static.Version, 1)))
+	s := &Server{cfg: cfg, log: log, agencies: map[string]*agency{}, registry: prometheus.NewRegistry()}
+	s.def = s.newAgency(DefaultAgency, cfg)
 	s.requests = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "mockbmtc_requests_total",
-		Help: "Requests served by the mock BMTC, by endpoint and outcome (ok or the fault action)"}, []string{"endpoint", "outcome"})
+		Help: "Requests served by the mock BMTC, by agency, endpoint and outcome (ok or the fault action)"}, []string{"agency", "endpoint", "outcome"})
 	s.bytes = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "mockbmtc_bytes_total",
-		Help: "Response body bytes written"}, []string{"endpoint"})
+		Help: "Response body bytes written"}, []string{"agency", "endpoint"})
 	s.entities = prometheus.NewCounterVec(prometheus.CounterOpts{Name: "mockbmtc_entities_total",
-		Help: "GTFS-RT entities or CSV rows served"}, []string{"endpoint"})
+		Help: "GTFS-RT entities or CSV rows served"}, []string{"agency", "endpoint"})
 	s.registry.MustRegister(s.requests, s.bytes, s.entities)
 	return s
 }
 
-// Faults is the server's fault rule set.
-func (s *Server) Faults() *faults.Set { return s.faults }
+func (s *Server) newAgency(id string, cfg Config) *agency {
+	a := &agency{id: id, cfg: cfg, faults: faults.NewSet(cfg.Seed), added: time.Now().UTC().Truncate(time.Second),
+		staticCache: map[int64]map[string]string{}, stats: map[string]*EndpointStats{}}
+	a.version.Store(int64(max(cfg.Static.Version, 1)))
+	return a
+}
+
+// Faults is the default agency's fault rule set.
+func (s *Server) Faults() *faults.Set { return s.def.faults }
+
+// AddAgency adds or replaces a named agency. Replacing keeps its faults,
+// stats and static version, so a token rotation doesn't reset a test.
+func (s *Server) AddAgency(spec AgencySpec) error {
+	if !agencyIDPattern.MatchString(spec.ID) || spec.ID == DefaultAgency {
+		return fmt.Errorf("agency_id must be 1-32 characters of A-Z, 0-9 and _")
+	}
+	if spec.Token == "" || len(spec.Token) > 256 {
+		return errors.New("token is required (at most 256 characters)")
+	}
+	if spec.Vehicles < 0 || spec.Vehicles > 50000 {
+		return errors.New("vehicles must be between 0 (default) and 50000")
+	}
+	cfg := s.cfg
+	cfg.Token = spec.Token
+	if spec.Vehicles > 0 {
+		cfg.Vehicles = spec.Vehicles
+	}
+	if spec.ShiftS != nil {
+		cfg.Shift = time.Duration(*spec.ShiftS) * time.Second
+	}
+	s.mu.Lock()
+	if old, ok := s.agencies[spec.ID]; ok {
+		old.cfg = cfg
+	} else {
+		if len(s.agencies) >= MaxAgencies {
+			s.mu.Unlock()
+			return fmt.Errorf("at most %d agencies", MaxAgencies)
+		}
+		s.agencies[spec.ID] = s.newAgency(spec.ID, cfg)
+	}
+	err := s.saveLocked()
+	s.mu.Unlock()
+	s.log.Info("agency set", "agency_id", spec.ID, "vehicles", cfg.Vehicles, "shift_s", int(cfg.Shift.Seconds()))
+	return err
+}
+
+// RemoveAgency removes a named agency; "" removes all. It reports whether
+// anything was removed.
+func (s *Server) RemoveAgency(id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := len(s.agencies)
+	if id == "" {
+		s.agencies = map[string]*agency{}
+	} else {
+		delete(s.agencies, id)
+	}
+	if len(s.agencies) == n {
+		return false, nil
+	}
+	s.log.Info("agency removed", "agency_id", id, "remaining", len(s.agencies))
+	return true, s.saveLocked()
+}
+
+// Agencies lists the named agencies, sorted by id.
+func (s *Server) Agencies() []AgencyInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]AgencyInfo, 0, len(s.agencies))
+	for _, a := range s.agencies {
+		out = append(out, AgencyInfo{ID: a.id, TokenSet: a.cfg.Token != "", Vehicles: a.cfg.Vehicles,
+			ShiftS: int(a.cfg.Shift.Seconds()), StaticVersion: a.version.Load(), AddedAt: a.added})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func (s *Server) lookup(id string) *agency {
+	if id == "" || id == DefaultAgency {
+		return s.def
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.agencies[id]
+}
+
+// UseStateFile loads named agencies from path (if it exists) and saves them
+// there on every change, mode 0600 (it holds their tokens).
+func (s *Server) UseStateFile(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	var specs []AgencySpec
+	if len(b) > 0 {
+		if err := json.Unmarshal(b, &specs); err != nil {
+			return fmt.Errorf("state file %s: %w", path, err)
+		}
+	}
+	for _, sp := range specs { // loaded before statePath is set: no rewrite per agency
+		if err := s.AddAgency(sp); err != nil {
+			return fmt.Errorf("state file %s: %s: %w", path, sp.ID, err)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.statePath = path
+	return s.saveLocked()
+}
+
+func (s *Server) saveLocked() error {
+	if s.statePath == "" {
+		return nil
+	}
+	specs := make([]AgencySpec, 0, len(s.agencies))
+	for _, a := range s.agencies {
+		shift := int(a.cfg.Shift.Seconds())
+		specs = append(specs, AgencySpec{ID: a.id, Token: a.cfg.Token, Vehicles: a.cfg.Vehicles, ShiftS: &shift})
+	}
+	sort.Slice(specs, func(i, j int) bool { return specs[i].ID < specs[j].ID })
+	b, _ := json.MarshalIndent(specs, "", "  ")
+	tmp := s.statePath + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(s.statePath), 0o700); err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.statePath)
+}
 
 // FeedHandler serves the three BMTC endpoints.
 func (s *Server) FeedHandler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST "+PathVehicles, s.vehicles)
-	mux.HandleFunc("POST "+PathTripUpdates, s.trips)
-	mux.HandleFunc("POST "+PathStatic, s.static)
+	for _, prefix := range []string{"", "/{agency}"} {
+		mux.HandleFunc("POST "+prefix+PathVehicles, s.withAgency(s.vehicles))
+		mux.HandleFunc("POST "+prefix+PathTripUpdates, s.withAgency(s.trips))
+		mux.HandleFunc("POST "+prefix+PathStatic, s.withAgency(s.static))
+	}
 	// Reachability check for the public path (host nginx -> web nginx ->
 	// mock). No auth and no data, so it is safe to expose with the feed.
 	mux.HandleFunc("GET /_ping", func(w http.ResponseWriter, _ *http.Request) {
@@ -157,45 +337,138 @@ func (s *Server) FeedHandler() http.Handler {
 	return mux
 }
 
+// withAgency resolves {agency} (absent: the default agency). An unknown
+// agency gets BMTC's auth error, so the mock doesn't reveal which IDs exist.
+func (s *Server) withAgency(h func(*agency, http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("agency")
+		if id == DefaultAgency { // the default agency is only served at the root paths
+			writeBMTCAuthError(w)
+			return
+		}
+		a := s.lookup(id)
+		if a == nil {
+			writeBMTCAuthError(w)
+			s.requests.WithLabelValues("unknown", "-", "unknown_agency").Inc()
+			return
+		}
+		h(a, w, r)
+	}
+}
+
+// agencyParam resolves ?agency= on a control request, writing 404 if unknown.
+func (s *Server) agencyParam(w http.ResponseWriter, r *http.Request) *agency {
+	a := s.lookup(r.URL.Query().Get("agency"))
+	if a == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "no agency " + r.URL.Query().Get("agency")})
+	}
+	return a
+}
+
 // ControlHandler serves the control API and /metrics.
 func (s *Server) ControlHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /_harness/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
-	mux.HandleFunc("GET /_harness/faults", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, http.StatusOK, s.faults.Rules()) })
+	mux.HandleFunc("GET /_harness/faults", func(w http.ResponseWriter, r *http.Request) {
+		if a := s.agencyParam(w, r); a != nil {
+			writeJSON(w, http.StatusOK, a.faults.Rules())
+		}
+	})
 	mux.HandleFunc("PUT /_harness/faults", func(w http.ResponseWriter, r *http.Request) {
+		a := s.agencyParam(w, r)
+		if a == nil {
+			return
+		}
 		var rules []faults.Rule
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&rules); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body must be a JSON list of rules: " + err.Error()})
 			return
 		}
-		if err := s.faults.Replace(rules); err != nil {
+		if err := a.faults.Replace(rules); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		s.log.Info("faults set", "rules", len(rules))
-		writeJSON(w, http.StatusOK, s.faults.Rules())
+		s.log.Info("faults set", "agency_id", a.id, "rules", len(rules))
+		writeJSON(w, http.StatusOK, a.faults.Rules())
 	})
-	mux.HandleFunc("DELETE /_harness/faults", func(w http.ResponseWriter, _ *http.Request) {
-		_ = s.faults.Replace(nil)
-		s.log.Info("faults cleared")
+	mux.HandleFunc("DELETE /_harness/faults", func(w http.ResponseWriter, r *http.Request) {
+		a := s.agencyParam(w, r)
+		if a == nil {
+			return
+		}
+		_ = a.faults.Replace(nil)
+		s.log.Info("faults cleared", "agency_id", a.id)
 		writeJSON(w, http.StatusOK, []faults.Rule{})
 	})
-	mux.HandleFunc("POST /_harness/static/bump", func(w http.ResponseWriter, _ *http.Request) {
-		v := s.version.Add(1)
-		s.log.Info("static version bumped", "version", v)
+	mux.HandleFunc("POST /_harness/static/bump", func(w http.ResponseWriter, r *http.Request) {
+		a := s.agencyParam(w, r)
+		if a == nil {
+			return
+		}
+		v := a.version.Add(1)
+		s.log.Info("static version bumped", "agency_id", a.id, "version", v)
 		writeJSON(w, http.StatusOK, map[string]int64{"version": v})
 	})
-	mux.HandleFunc("GET /_harness/stats", func(w http.ResponseWriter, _ *http.Request) {
-		s.statsMu.Lock()
-		defer s.statsMu.Unlock()
-		writeJSON(w, http.StatusOK, map[string]any{"static_version": s.version.Load(), "endpoints": s.stats})
+	mux.HandleFunc("GET /_harness/stats", func(w http.ResponseWriter, r *http.Request) {
+		a := s.agencyParam(w, r)
+		if a == nil {
+			return
+		}
+		a.statsMu.Lock()
+		defer a.statsMu.Unlock()
+		writeJSON(w, http.StatusOK, map[string]any{"agency_id": a.id, "static_version": a.version.Load(), "endpoints": a.stats})
+	})
+	mux.HandleFunc("GET /_harness/agencies", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"agencies": s.Agencies()})
+	})
+	mux.HandleFunc("PUT /_harness/agencies/{agency_id}", func(w http.ResponseWriter, r *http.Request) {
+		var spec AgencySpec
+		dec := json.NewDecoder(io.LimitReader(r.Body, 16<<10))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&spec); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": `body must be {"token": "...", "vehicles": n, "shift_s": n}: ` + err.Error()})
+			return
+		}
+		if spec.ID != "" && spec.ID != r.PathValue("agency_id") {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "agency_id in the body does not match the path"})
+			return
+		}
+		spec.ID = r.PathValue("agency_id")
+		if err := s.AddAgency(spec); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		for _, a := range s.Agencies() {
+			if a.ID == spec.ID {
+				writeJSON(w, http.StatusOK, a)
+				return
+			}
+		}
+	})
+	mux.HandleFunc("DELETE /_harness/agencies/{agency_id}", func(w http.ResponseWriter, r *http.Request) {
+		ok, err := s.RemoveAgency(r.PathValue("agency_id"))
+		switch {
+		case err != nil:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		case !ok:
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no agency " + r.PathValue("agency_id")})
+		default:
+			writeJSON(w, http.StatusOK, map[string]any{"removed": r.PathValue("agency_id")})
+		}
+	})
+	mux.HandleFunc("DELETE /_harness/agencies", func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := s.RemoveAgency(""); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"agencies": []AgencyInfo{}})
 	})
 	mux.Handle("GET /metrics", promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{}))
 	return mux
 }
 
-func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
-	if r.Header.Get("authToken") == s.cfg.Token {
+func (a *agency) authorized(w http.ResponseWriter, r *http.Request) bool {
+	if subtleEqual(r.Header.Get("authToken"), a.cfg.Token) {
 		return true
 	}
 	writeBMTCAuthError(w)
@@ -209,23 +482,23 @@ func writeBMTCAuthError(w http.ResponseWriter) {
 	_, _ = w.Write([]byte(`{"status":"Error","errorMessage":"Invalid Token"}`))
 }
 
-func (s *Server) vehicles(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(w, r) {
-		s.count(faults.EndpointVehicles, "unauthorized", 0, 0)
+func (s *Server) vehicles(a *agency, w http.ResponseWriter, r *http.Request) {
+	if !a.authorized(w, r) {
+		s.count(a, faults.EndpointVehicles, "unauthorized", 0, 0)
 		return
 	}
-	s.respond(w, faults.EndpointVehicles, 0, func() ([]byte, string, int, error) {
+	s.respond(a, w, faults.EndpointVehicles, 0, func() ([]byte, string, int, error) {
 		feed := fakefeed.Build(fakefeed.Options{
-			Now: time.Now(), Vehicles: s.cfg.Vehicles, Shift: s.cfg.Shift,
-			Dupes: s.cfg.Dupes, Stale: s.cfg.Stale, Invalid: s.cfg.Invalid, Seed: s.nextSeed(),
+			Now: time.Now(), Vehicles: a.cfg.Vehicles, Shift: a.cfg.Shift,
+			Dupes: a.cfg.Dupes, Stale: a.cfg.Stale, Invalid: a.cfg.Invalid, Seed: s.nextSeed(),
 		})
-		return s.encodeFeed(feed)
+		return s.encodeFeed(a, feed)
 	})
 }
 
-func (s *Server) trips(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(w, r) {
-		s.count(faults.EndpointTrips, "unauthorized", 0, 0)
+func (s *Server) trips(a *agency, w http.ResponseWriter, r *http.Request) {
+	if !a.authorized(w, r) {
+		s.count(a, faults.EndpointTrips, "unauthorized", 0, 0)
 		return
 	}
 	var req struct {
@@ -233,25 +506,25 @@ func (s *Server) trips(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.ZoneID == nil || *req.ZoneID < 1 || *req.ZoneID > 7 {
 		http.Error(w, `body must be {"zoneid": 1..7}`, http.StatusBadRequest)
-		s.count(faults.EndpointTrips, "bad_request", 0, 0)
+		s.count(a, faults.EndpointTrips, "bad_request", 0, 0)
 		return
 	}
 	zone := *req.ZoneID
-	s.respond(w, faults.EndpointTrips, zone, func() ([]byte, string, int, error) {
+	s.respond(a, w, faults.EndpointTrips, zone, func() ([]byte, string, int, error) {
 		feed := fakefeed.TripUpdates(fakefeed.TripOptions{
-			Now: time.Now(), Zone: zone, Trips: s.cfg.TripsPerZone, StopsPerTrip: s.cfg.StopsPerTrip,
-			CrossZone: s.cfg.TripsPerZone / 20, Invalid: 3, Seed: s.nextSeed(),
+			Now: time.Now(), Zone: zone, Trips: a.cfg.TripsPerZone, StopsPerTrip: a.cfg.StopsPerTrip,
+			CrossZone: a.cfg.TripsPerZone / 20, Invalid: 3, Seed: s.nextSeed(),
 		})
-		return s.encodeFeed(feed)
+		return s.encodeFeed(a, feed)
 	})
 }
 
 // Static: {"check": n} returns one GTFS file. The check → file mapping is
 // shuffled on purpose (fakefeed.StaticCheckOrder): the collector must
 // identify files by header, not by check number.
-func (s *Server) static(w http.ResponseWriter, r *http.Request) {
-	if !s.authorized(w, r) {
-		s.count(faults.EndpointStatic, "unauthorized", 0, 0)
+func (s *Server) static(a *agency, w http.ResponseWriter, r *http.Request) {
+	if !a.authorized(w, r) {
+		s.count(a, faults.EndpointStatic, "unauthorized", 0, 0)
 		return
 	}
 	var req struct {
@@ -261,21 +534,21 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Check == nil ||
 		*req.Check < 0 || *req.Check >= len(fakefeed.StaticCheckOrder) {
 		http.Error(w, `body must be {"check": 0..7}`, http.StatusBadRequest)
-		s.count(faults.EndpointStatic, "bad_request", 0, 0)
+		s.count(a, faults.EndpointStatic, "bad_request", 0, 0)
 		return
 	}
 	zone := 0
 	if req.ZoneID != nil {
 		zone = *req.ZoneID
 	}
-	s.respond(w, faults.EndpointStatic, zone, func() ([]byte, string, int, error) {
+	s.respond(a, w, faults.EndpointStatic, zone, func() ([]byte, string, int, error) {
 		name := fakefeed.StaticCheckOrder[*req.Check]
-		csv := s.staticFiles(s.version.Load())[name]
-		if name == "stop_times.txt" && s.cfg.StaticZoned {
+		csv := a.staticFiles(a.version.Load())[name]
+		if name == "stop_times.txt" && a.cfg.StaticZoned {
 			csv = fakefeed.StaticZone(csv, req.ZoneID)
 		}
 		lines := strings.Split(strings.TrimRight(csv, "\n"), "\n")
-		if s.cfg.Format != FormatBMTC {
+		if a.cfg.Format != FormatBMTC {
 			return []byte(csv), "text/csv", len(lines) - 1, nil
 		}
 		data, err := json.Marshal(lines)
@@ -287,23 +560,24 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) staticFiles(v int64) map[string]string {
-	s.staticMu.Lock()
-	defer s.staticMu.Unlock()
-	if f, ok := s.staticCache[v]; ok {
+func (a *agency) staticFiles(v int64) map[string]string {
+	a.staticMu.Lock()
+	defer a.staticMu.Unlock()
+	if f, ok := a.staticCache[v]; ok {
 		return f
 	}
-	o := s.cfg.Static
+	o := a.cfg.Static
 	o.Version = int(v)
 	f := fakefeed.StaticFiles(o)
-	s.staticCache[v] = f
+	clear(a.staticCache) // keep only the current version
+	a.staticCache[v] = f
 	return f
 }
 
 func (s *Server) nextSeed() uint64 { return s.cfg.Seed*1_000_003 + s.seq.Add(1) }
 
-func (s *Server) encodeFeed(feed *gtfs.FeedMessage) ([]byte, string, int, error) {
-	if s.cfg.Format == FormatProtobuf {
+func (s *Server) encodeFeed(a *agency, feed *gtfs.FeedMessage) ([]byte, string, int, error) {
+	if a.cfg.Format == FormatProtobuf {
 		return fakefeed.Marshal(feed), "application/x-protobuf", len(feed.Entity), nil
 	}
 	// Real BMTC uses snake_case names and string uint64s: protojson with
@@ -312,24 +586,24 @@ func (s *Server) encodeFeed(feed *gtfs.FeedMessage) ([]byte, string, int, error)
 	if err != nil {
 		return nil, "", 0, err
 	}
-	if s.cfg.Format == FormatBMTC {
+	if a.cfg.Format == FormatBMTC {
 		js = fmt.Appendf(nil, `{"Data":%s,"Message":null,"IsSuccess":true,"Exception":null,"RowCount":%d}`, js, len(feed.Entity))
 	}
 	return js, "application/json; charset=utf-8", len(feed.Entity), nil
 }
 
 // respond applies the first matching fault, else serves build()'s body.
-func (s *Server) respond(w http.ResponseWriter, endpoint string, zone int, build func() ([]byte, string, int, error)) {
-	rule := s.faults.Match(endpoint, zone)
+func (s *Server) respond(a *agency, w http.ResponseWriter, endpoint string, zone int, build func() ([]byte, string, int, error)) {
+	rule := a.faults.Match(endpoint, zone)
 	if rule != nil {
 		switch rule.Action {
 		case faults.ActionStatus:
 			http.Error(w, fmt.Sprintf("mock fault: HTTP %d", rule.Status), rule.Status)
-			s.count(endpoint, "status_"+fmt.Sprint(rule.Status), 0, 0)
+			s.count(a, endpoint, "status_"+fmt.Sprint(rule.Status), 0, 0)
 			return
 		case faults.ActionAuth:
 			writeBMTCAuthError(w)
-			s.count(endpoint, faults.ActionAuth, 0, 0)
+			s.count(a, endpoint, faults.ActionAuth, 0, 0)
 			return
 		case faults.ActionDrop:
 			if hj, ok := w.(http.Hijacker); ok {
@@ -337,7 +611,7 @@ func (s *Server) respond(w http.ResponseWriter, endpoint string, zone int, build
 					_ = conn.Close()
 				}
 			}
-			s.count(endpoint, faults.ActionDrop, 0, 0)
+			s.count(a, endpoint, faults.ActionDrop, 0, 0)
 			return
 		case faults.ActionDelay:
 			time.Sleep(time.Duration(rule.Delay))
@@ -347,7 +621,7 @@ func (s *Server) respond(w http.ResponseWriter, endpoint string, zone int, build
 	body, contentType, entities, err := build()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		s.count(endpoint, "error", 0, 0)
+		s.count(a, endpoint, "error", 0, 0)
 		return
 	}
 	outcome := "ok"
@@ -364,7 +638,7 @@ func (s *Server) respond(w http.ResponseWriter, endpoint string, zone int, build
 	if rule != nil && rule.Action == faults.ActionDelay {
 		outcome = faults.ActionDelay
 	}
-	s.count(endpoint, outcome, len(body), entities)
+	s.count(a, endpoint, outcome, len(body), entities)
 }
 
 // trickle writes body in 20 chunks spread over d.
@@ -397,24 +671,28 @@ func malform(body []byte, mode string, seed uint64) []byte {
 	}
 }
 
-func (s *Server) count(endpoint, outcome string, bytes, entities int) {
-	s.requests.WithLabelValues(endpoint, outcome).Inc()
-	s.bytes.WithLabelValues(endpoint).Add(float64(bytes))
-	s.entities.WithLabelValues(endpoint).Add(float64(entities))
-	s.statsMu.Lock()
-	st := s.stats[endpoint]
+func (s *Server) count(a *agency, endpoint, outcome string, bytes, entities int) {
+	s.requests.WithLabelValues(a.id, endpoint, outcome).Inc()
+	s.bytes.WithLabelValues(a.id, endpoint).Add(float64(bytes))
+	s.entities.WithLabelValues(a.id, endpoint).Add(float64(entities))
+	a.statsMu.Lock()
+	st := a.stats[endpoint]
 	if st == nil {
 		st = &EndpointStats{Outcomes: map[string]int64{}}
-		s.stats[endpoint] = st
+		a.stats[endpoint] = st
 	}
 	st.Requests++
 	st.Outcomes[outcome]++
 	st.Bytes += int64(bytes)
 	st.Entities += int64(entities)
-	s.statsMu.Unlock()
+	a.statsMu.Unlock()
 	if outcome != "ok" {
-		s.log.Info("served with fault", "endpoint", endpoint, "outcome", outcome)
+		s.log.Info("served with fault", "agency_id", a.id, "endpoint", endpoint, "outcome", outcome)
 	}
+}
+
+func subtleEqual(got, want string) bool {
+	return want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

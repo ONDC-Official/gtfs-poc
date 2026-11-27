@@ -30,6 +30,9 @@ func run(ctx context.Context, st stack.Stack, path, outDir string) (bool, error)
 	if err != nil {
 		return false, err
 	}
+	if sc.AgencyCount != 1 {
+		return false, fmt.Errorf("agency_count %d: the local stack has one agency; use --target dev for more", sc.AgencyCount)
+	}
 	state, err := st.LoadState()
 	if err != nil {
 		return false, err
@@ -84,7 +87,7 @@ func run(ctx context.Context, st stack.Stack, path, outDir string) (bool, error)
 	go runFaultSchedule(pctx, sc.FaultSchedule, logf)
 	time.Sleep(time.Second) // first version observation
 
-	phases := toPhases(sc, ids)
+	phases := toPhases(sc, ids, agency)
 	start := time.Now()
 	logf("running %d phase(s), %s in total", len(phases), sc.TotalDuration())
 	results := load.Run(ctx, target, phases)
@@ -154,7 +157,7 @@ func envFor(sc *scenario.Scenario) map[string]string {
 	return env
 }
 
-func toPhases(sc *scenario.Scenario, ids map[string][]load.Identity) []load.Phase {
+func toPhases(sc *scenario.Scenario, ids map[string][]load.Identity, agency string) []load.Phase {
 	var out []load.Phase
 	for _, ph := range sc.Phases {
 		p := load.Phase{Name: ph.Name, Duration: ph.Duration.D()}
@@ -172,12 +175,17 @@ func toPhases(sc *scenario.Scenario, ids map[string][]load.Identity) []load.Phas
 }
 
 func setFaults(ctx context.Context, rules any) error {
+	return setFaultsAt(ctx, stack.MockControlURL+"/_harness/faults", rules)
+}
+
+// setFaultsAt replaces (rules != nil) or clears the fault rules at url.
+func setFaultsAt(ctx context.Context, url string, rules any) error {
 	method, body := http.MethodDelete, io.Reader(nil)
 	if rules != nil {
 		b, _ := json.Marshal(rules)
 		method, body = http.MethodPut, bytes.NewReader(b)
 	}
-	req, _ := http.NewRequestWithContext(ctx, method, stack.MockControlURL+"/_harness/faults", body)
+	req, _ := http.NewRequestWithContext(ctx, method, url, body)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("mock control API: %w", err)
@@ -191,6 +199,10 @@ func setFaults(ctx context.Context, rules any) error {
 }
 
 func runFaultSchedule(ctx context.Context, steps []scenario.FaultStep, logf func(string, ...any)) {
+	runFaultScheduleWith(ctx, steps, logf, func(ctx context.Context, rules any) error { return setFaults(ctx, rules) })
+}
+
+func runFaultScheduleWith(ctx context.Context, steps []scenario.FaultStep, logf func(string, ...any), set func(context.Context, any) error) {
 	sort.Slice(steps, func(i, j int) bool { return steps[i].At < steps[j].At })
 	start := time.Now()
 	for _, s := range steps {
@@ -203,7 +215,7 @@ func runFaultSchedule(ctx context.Context, steps []scenario.FaultStep, logf func
 		if len(s.Rules) > 0 {
 			rules = s.Rules
 		}
-		if err := setFaults(ctx, rules); err != nil {
+		if err := set(ctx, rules); err != nil {
 			logf("fault step at %s failed: %v", s.At.D(), err)
 			continue
 		}

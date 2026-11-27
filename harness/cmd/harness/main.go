@@ -45,12 +45,22 @@ func main() {
 		fail(up(ctx, st, abs(*collector), abs(*consumer)))
 	case "run":
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
-		out := fs.String("out", "reports", "report directory")
+		out := fs.String("out", envOr("HARNESS_REPORTS_DIR", "reports"), "report directory")
+		target := fs.String("target", envOr("HARNESS_TARGET", "local"), "local (this machine's stack) or dev (a deployed Transit Hub, from outside)")
 		_ = fs.Parse(os.Args[2:])
 		if fs.NArg() != 1 {
 			usage()
 		}
-		passed, err := run(ctx, st, fs.Arg(0), *out)
+		var passed bool
+		var err error
+		switch *target {
+		case "local":
+			passed, err = run(ctx, st, fs.Arg(0), *out)
+		case "dev":
+			passed, err = runDev(ctx, fs.Arg(0), *out)
+		default:
+			err = fmt.Errorf("unknown --target %q (local or dev)", *target)
+		}
 		fail(err)
 		if !passed {
 			os.Exit(3)
@@ -66,6 +76,10 @@ func main() {
 			args = append(args, "-v")
 		}
 		fail(st.Compose(ctx, args...))
+	case "cleanup":
+		// Dev target: removes every MOCK_ agency from the target and the mock
+		// (after a killed run).
+		fail(cleanupDev(ctx))
 	case "help", "-h", "--help":
 		fmt.Println(helpText)
 	default:
@@ -80,10 +94,18 @@ const helpText = `harness: Transit Hub perf harness
 Local stack (developer machine, from harness/):
   harness up | run <scenario.yaml> | status | down
 
-On the gtfs-poc server (compose profile "harness"):
-  The mock BMTC runs as the harness-mock service and is published at
-  /gtfs/mock-agency/. Running scenarios against dev (harness run --target dev)
-  arrives with plan items G2-G3; see harness/README.md.`
+Deployed target (gtfs-poc server, compose profile "harness"):
+  harness run --target dev /scenarios/dev/<scenario>.yaml
+      creates MOCK_nn agencies on the target through its agency admin API,
+      registers their tokens with the mock, starts polling, creates buyers,
+      runs the load, writes the report, then cleans up
+  harness cleanup
+      removes every MOCK_ agency from the target and the mock (after a
+      killed run)
+
+  Settings (environment): HARNESS_CONSUMER_URL, HARNESS_MOCK_PUBLIC_URL,
+  HARNESS_MOCK_CONTROL_URL, HARNESS_ADMIN_API_KEY, HARNESS_ALLOWED_HOSTS,
+  HARNESS_REPORTS_DIR. See harness/README.md.`
 
 func up(ctx context.Context, st stack.Stack, collectorSrc, consumerSrc string) error {
 	state, err := st.Init(collectorSrc, consumerSrc)
@@ -118,7 +140,7 @@ func abs(p string) string {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: harness up | run <scenario.yaml> | status | down")
+	fmt.Fprintln(os.Stderr, "usage: harness up | run [--target local|dev] <scenario.yaml> | status | down | cleanup | help")
 	os.Exit(2)
 }
 

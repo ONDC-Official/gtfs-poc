@@ -30,7 +30,7 @@ func TestValidateRejects(t *testing.T) {
 		"no phases":     "scenario_id: x\nidentities: {valid: 1}\n",
 		"bad endpoint":  "scenario_id: x\nidentities: {valid: 1}\nphases: [{name: p, duration: 1s, profiles: [{name: a, endpoint: nope, rps: 1}]}]\n",
 		"unused kind":   "scenario_id: x\nidentities: {valid: 1}\nphases: [{name: p, duration: 1s, profiles: [{name: a, endpoint: realtime, rps: 1, identities: [malformed]}]}]\n",
-		"agencies":      "scenario_id: x\nagency_count: 5\nidentities: {valid: 1}\nphases: [{name: p, duration: 1s, profiles: [{name: a, endpoint: realtime, rps: 1}]}]\n",
+		"agencies":      "scenario_id: x\nagency_count: 26\nidentities: {valid: 1}\nphases: [{name: p, duration: 1s, profiles: [{name: a, endpoint: realtime, rps: 1}]}]\n",
 		"bad fault":     "scenario_id: x\nidentities: {valid: 1}\nphases: [{name: p, duration: 1s, profiles: [{name: a, endpoint: realtime, rps: 1}]}]\nfault_schedule: [{at: 1s, rules: [{endpoint: vehicles, action: status, status: 200}]}]\n",
 	}
 	for name, body := range cases {
@@ -41,5 +41,13 @@ func TestValidateRejects(t *testing.T) {
 		} else if !strings.Contains(err.Error(), "s.yaml") {
 			t.Errorf("%s: error without file name: %v", name, err)
 		}
+	}
+}
+
+func TestAgencyCountRange(t *testing.T) {
+	p := t.TempDir() + "/s.yaml"
+	_ = os.WriteFile(p, []byte("scenario_id: x\nagency_count: 5\nidentities: {valid: 1}\nphases: [{name: p, duration: 1s, profiles: [{name: a, endpoint: realtime, rps: 1, identities: [valid]}]}]\n"), 0o644)
+	if s, err := Load(p); err != nil || s.AgencyCount != 5 {
+		t.Fatalf("agency_count 5: %v", err)
 	}
 }

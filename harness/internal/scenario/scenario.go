@@ -17,11 +17,15 @@ import (
 )
 
 // Scenario is one manifest.
+// MaxAgencies is the most mock agencies a dev run creates (the test plan's
+// ramp goes to 25; the dev consumer's ADMIN_AGENCY_MAX defaults to 30).
+const MaxAgencies = 25
+
 type Scenario struct {
 	ID          string `yaml:"scenario_id"`
 	Description string `yaml:"description"`
 	Seed        uint64 `yaml:"seed"`
-	AgencyCount int    `yaml:"agency_count"` // M1 supports 1
+	AgencyCount int    `yaml:"agency_count"` // local stack: 1; dev target: 1..MaxAgencies (MOCK_01..)
 
 	Upstream   Upstream   `yaml:"upstream"`
 	Collector  Collector  `yaml:"collector"`
@@ -176,8 +180,8 @@ func (s *Scenario) Validate() error {
 	if s.ID == "" {
 		return fmt.Errorf("scenario_id is required")
 	}
-	if s.AgencyCount != 1 {
-		return fmt.Errorf("agency_count %d: only 1 is supported until the synthetic-agency token lands (plan step 5)", s.AgencyCount)
+	if s.AgencyCount < 1 || s.AgencyCount > MaxAgencies {
+		return fmt.Errorf("agency_count %d: must be 1..%d", s.AgencyCount, MaxAgencies)
 	}
 	if s.Collector.IntervalS < 5 {
 		return fmt.Errorf("collector_interval_s must be >= 5 (the collector's minimum)")

@@ -201,6 +201,10 @@ services:
       - -control-addr=:9091
       - -token=${HARNESS_MOCK_TOKEN:-change-me}
       - -vehicles=${HARNESS_MOCK_VEHICLES:-7000}
+      # Named agencies (MOCK_nn) and their tokens survive a mock restart.
+      - -state=/state/agencies.json
+    volumes:
+      - harness-state:/state
     expose:
       - "9080"
       - "9091"
@@ -239,8 +243,9 @@ services:
       HARNESS_ADMIN_API_KEY: ${HARNESS_ADMIN_API_KEY:-}
       HARNESS_MAX_MBIT: ${HARNESS_MAX_MBIT:-50}
       HARNESS_FAULTS_ALLOWED: ${HARNESS_FAULTS_ALLOWED:-false}
+      HARNESS_ALLOWED_HOSTS: ${HARNESS_ALLOWED_HOSTS:-}
+      HARNESS_REPORTS_DIR: /reports
     volumes:
-      - harness-state:/state
       - harness-reports:/reports
       - ./harness/scenarios:/scenarios:ro
     cpus: ${HARNESS_CPUS:-1.0}

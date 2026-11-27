@@ -46,6 +46,7 @@ func main() {
 	staticRoutes := flag.Int("static-routes", d.Static.Routes, "static: routes")
 	staticTrips := flag.Int("static-trips-per-route", d.Static.TripsPerRoute, "static: trips per route (drives zip size)")
 	staticStopsPerTrip := flag.Int("static-stops-per-trip", d.Static.StopsPerTrip, "static: stop_times per trip (drives zip size)")
+	state := flag.String("state", "", "file that keeps named agencies (and their tokens) across restarts; empty: memory only")
 	healthcheck := flag.String("healthcheck", "", "GET this URL and exit 0 on 200 (container healthcheck; distroless has no curl)")
 	flag.Parse()
 	if *healthcheck != "" {
@@ -71,6 +72,13 @@ func main() {
 		os.Exit(2)
 	}
 	s := mock.New(cfg, log)
+	if *state != "" {
+		if err := s.UseStateFile(*state); err != nil {
+			log.Error("state file", "err", err)
+			os.Exit(1)
+		}
+		log.Info("named agencies loaded", "state", *state, "agencies", len(s.Agencies()))
+	}
 
 	feed := &http.Server{Addr: *addr, Handler: s.FeedHandler(), ReadHeaderTimeout: 10 * time.Second}
 	control := &http.Server{Addr: *controlAddr, Handler: s.ControlHandler(), ReadHeaderTimeout: 10 * time.Second}

@@ -1,0 +1,28 @@
+# TC-1 short: payload baseline from outside. One MOCK_ agency with 7,000
+# vehicles every 10 s; buyers read it back and every response is checked
+# (protobuf valid, every vehicle has an id, no duplicates, timestamps
+# corrected, data fresh). Short version of the 30-minute TC-1.
+scenario_id: dev-tc-01-short
+description: >
+  TC-1 short: 7,000-vehicle feed every 10 s, read back and checked.
+seed: 1
+agency_count: 1
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 120
+identities:
+  valid: 3
+ready_timeout: 6m
+phases:
+  - name: baseline
+    duration: 2m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 3, concurrency: 3, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.2, concurrency: 1, identities: [valid] }
+acceptance_thresholds:
+  availability_min: 0.99
+  check_failures_max: 0
+  client_saturated_max: 0
+  data_age_s_max: 40          # 10 s cadence + collector, projector and request time

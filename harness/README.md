@@ -142,11 +142,63 @@ docker compose --profile harness stop harness-mock
 When `harness-mock` isn't running, `/gtfs/mock-agency/` answers 502 and the
 demo is unaffected.
 
-**Status (step 1 of the integration plan):** packaging only. The mock serves
-one agency at its root path with `HARNESS_MOCK_TOKEN`. Still to come:
-- per-agency paths and tokens (`/MOCK_nn/…`, G2);
-- dev target mode, measurements, safety, cleanup and dev scenarios (G3–G7);
-- the fault adapter (G9).
+### Named mock agencies (G2)
 
-Plan: `docs/gtfs-poc-harness-integration-plan.md` in the transit-hub
-workspace.
+The mock serves any number of named agencies under `/{agency_id}/…`, each
+with its own token, data settings, faults, static version and stats:
+
+```bash
+C=http://127.0.0.1:19191
+curl -X PUT $C/_harness/agencies/MOCK_01 -d '{"token":"tha_…","vehicles":7000,"shift_s":19800}'
+curl $C/_harness/agencies                          # lists them, never their tokens
+curl -X PUT "$C/_harness/faults?agency=MOCK_01" -d '[{"endpoint":"vehicles","action":"status","status":503}]'
+curl "$C/_harness/stats?agency=MOCK_01"
+curl -X DELETE $C/_harness/agencies/MOCK_01
+```
+
+An unknown agency gets BMTC's "Invalid Token" 401, so the feed doesn't
+reveal which IDs exist. Agencies and their tokens are kept in
+`/state/agencies.json` (mode 0600, `harness-state` volume), so a mock restart
+keeps serving them. The root paths are still the default agency
+(`HARNESS_MOCK_TOKEN`), as the local stack uses.
+
+### Running against a deployed Transit Hub (G3)
+
+```bash
+# in the server's .env: HARNESS_ADMIN_API_KEY=<target consumer admin key>
+docker compose --profile harness up -d --build harness-mock
+docker compose --profile harness run --rm harness run --target dev /scenarios/dev/tc-06-smoke.yaml
+docker compose --profile harness run --rm harness cleanup        # only after a killed run
+```
+
+A dev run, entirely through public APIs:
+1. **Preflight:** the target's `/readyz`, its agency API (admin key valid, managed prefix `MOCK_`) and the mock.
+2. **Agencies:** `POST /v1/admin/agencies` for `MOCK_01…MOCK_nn` with `feed_base_url = HARNESS_MOCK_PUBLIC_URL/MOCK_nn`, the scenario's interval and retention, and `vehicle_ts_offset_s: 19800`.
+3. **Tokens:** each returned `auth_token` is registered with the mock (`PUT /_harness/agencies/MOCK_nn`), then polling is started (`PUT …/polling`).
+4. **Buyers:** created with grants to the mock agencies only. The run waits until a buyer gets real-time data and a static zip.
+5. **Load:** the scenario's phases and checks run against `MOCK_01`; fault steps apply to every mock agency.
+6. **Report:** written to `/reports` (`harness-reports` volume).
+7. **Cleanup** (always, also on Ctrl-C):
+   - polling is stopped;
+   - after one collector reload (`HARNESS_CLEANUP_WAIT`, default 35 s), the agencies are purged on the target, which also removes the buyers' grants;
+   - the mock forgets them.
+
+**Safety:**
+- **Targets:** only `gtfs-dev.ondc.tech` unless `HARNESS_ALLOWED_HOSTS` adds a host.
+- **Agencies:** only `MOCK_` agencies are created or touched.
+- **Secrets:** the admin key comes from the environment only, and tokens are never logged or written to reports.
+
+**Dev scenarios** (`scenarios/dev/`, short, low-rate):
+
+| Scenario | Covers |
+|---|---|
+| `tc-01-short.yaml` | TC-1: 7,000-vehicle feed every 10 s, read back and checked |
+| `tc-02-ramp-short.yaml` | TC-2: three agencies collected in parallel |
+| `tc-05-upstream-faults-short.yaml` | TC-5 agency side: 503s, then timeouts, then recovery |
+| `tc-06-smoke.yaml` | TC-6: every endpoint and access check at low rate |
+
+**Not yet:**
+- server-side measurements: projector lag, collection success, alerts (G4);
+- auto-stop and the host-load guard (G5);
+- deactivating the run's buyers, which needs the consumer's profile admin API (A2). Until then they stay active, but with no grants left;
+- the fault adapter (G9).

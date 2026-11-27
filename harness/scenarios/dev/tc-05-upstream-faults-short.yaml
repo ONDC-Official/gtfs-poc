@@ -1,0 +1,33 @@
+# TC-5 short (agency side): the mock fails the collector's vehicle calls
+# for a while, then recovers. Buyers keep being served (last good data until
+# retention), and fresh data returns after recovery.
+#   0:00-0:40  normal
+#   0:40-1:20  every vehicle call answers 503
+#   1:20-2:00  vehicle calls time out (12 s delay, past the 10 s timeout)
+#   2:00-3:00  normal again: data must be fresh again
+scenario_id: dev-tc-05-upstream-faults-short
+description: >
+  TC-5 short: 503s then timeouts on the vehicle feed, then recovery.
+seed: 5
+agency_count: 1
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 300            # longer than the fault window: buyers keep the last good data
+identities:
+  valid: 3
+ready_timeout: 6m
+phases:
+  - name: faults-and-recovery
+    duration: 3m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+fault_schedule:
+  - { at: 40s, rules: [{ endpoint: vehicles, action: status, status: 503 }] }
+  - { at: 80s, rules: [{ endpoint: vehicles, action: delay, delay: 12s }] }
+  - { at: 120s, rules: [] }
+acceptance_thresholds:
+  availability_min: 0.99      # buyers must not see the agency's failure
+  check_failures_max: 0
+  client_saturated_max: 0

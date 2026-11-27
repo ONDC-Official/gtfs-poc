@@ -15,8 +15,9 @@ import (
 type IdentitySpec struct {
 	Valid, LowQuota, Malformed, UnknownAgency int
 	LowQuotaPerMin                            int
-	Agency                                    string
-	RunID                                     string // part of every profile name, to find them later
+	Agency                                    string   // grant, when Agencies is empty
+	Agencies                                  []string // grants (dev target: every mock agency)
+	RunID                                     string   // part of every profile name, to find them later
 }
 
 // CreateIdentities creates the buyers through the Consumer admin API
@@ -27,8 +28,15 @@ func CreateIdentities(ctx context.Context, baseURL, adminKey string, spec Identi
 	out := map[string][]Identity{}
 	create := func(kind string, i, quota int) error {
 		name := fmt.Sprintf("perf %s %s %d", spec.RunID, kind, i)
-		body, _ := json.Marshal(map[string]any{"name": name,
-			"grants": []map[string]any{{"agency_id": spec.Agency, "quota_per_min": quota}}})
+		agencies := spec.Agencies
+		if len(agencies) == 0 {
+			agencies = []string{spec.Agency}
+		}
+		grants := make([]map[string]any, 0, len(agencies))
+		for _, a := range agencies {
+			grants = append(grants, map[string]any{"agency_id": a, "quota_per_min": quota})
+		}
+		body, _ := json.Marshal(map[string]any{"name": name, "grants": grants})
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/admin/profiles", bytes.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+adminKey)
 		req.Header.Set("Content-Type", "application/json")

@@ -44,6 +44,8 @@ type Env struct {
 	ConsumerRev        string `json:"consumer_rev"`
 	HarnessRev         string `json:"harness_rev"`
 	CollectorIntervalS int    `json:"collector_interval_s"`
+	// Target is the deployed Transit Hub tested from outside ("" = the local stack).
+	Target string `json:"target,omitempty"`
 }
 
 // System is what Prometheus saw during the measured window.
@@ -177,9 +179,15 @@ func (r *Report) Markdown() string {
 	fmt.Fprintf(&b, "# %s: %s\n\n%s\n\n", r.ScenarioID, verdict, r.Description)
 	fmt.Fprintf(&b, "- Run `%s`, %s → %s (%s)\n", r.RunID, r.Start.Format(time.RFC3339), r.End.Format(time.RFC3339), r.End.Sub(r.Start).Round(time.Second))
 	fmt.Fprintf(&b, "- Seed %d; collector interval %d s; ready after %.0f s\n", r.Seed, r.Environment.CollectorIntervalS, r.ReadyAfterS)
-	fmt.Fprintf(&b, "- Collector `%s`, consumer `%s`, harness `%s`; host %s, %d CPUs\n\n",
-		r.Environment.CollectorRev, r.Environment.ConsumerRev, r.Environment.HarnessRev, r.Environment.Host, r.Environment.CPUs)
-	b.WriteString("Local results: comparable between runs on this machine, not production capacity.\n\n")
+	if r.Environment.Target != "" {
+		fmt.Fprintf(&b, "- Target `%s` (deployed, tested from outside); harness `%s` on %s, %d CPUs\n\n",
+			r.Environment.Target, r.Environment.HarnessRev, r.Environment.Host, r.Environment.CPUs)
+		b.WriteString("Measured from outside through public APIs: includes the network path to the target.\n\n")
+	} else {
+		fmt.Fprintf(&b, "- Collector `%s`, consumer `%s`, harness `%s`; host %s, %d CPUs\n\n",
+			r.Environment.CollectorRev, r.Environment.ConsumerRev, r.Environment.HarnessRev, r.Environment.Host, r.Environment.CPUs)
+		b.WriteString("Local results: comparable between runs on this machine, not production capacity.\n\n")
+	}
 
 	b.WriteString("## Thresholds\n\n| Check | Limit | Actual | Result |\n|---|---|---|---|\n")
 	for _, c := range r.Checks {
@@ -211,6 +219,18 @@ func (r *Report) Markdown() string {
 		}
 	}
 
+	if r.Environment.Target != "" {
+		b.WriteString("\n\n## Mock agencies (what the target collector fetched)\n\n")
+		if len(r.Mock) > 0 {
+			fmt.Fprintf(&b, "```json\n%s\n```\n", r.Mock)
+		} else {
+			b.WriteString("no data\n")
+		}
+		for _, n := range r.Notes {
+			fmt.Fprintf(&b, "\nNote: %s\n", n)
+		}
+		return b.String()
+	}
 	b.WriteString("\n\n## System (Prometheus, measured window)\n\n")
 	f := func(p *float64, unit string) string {
 		if p == nil {
