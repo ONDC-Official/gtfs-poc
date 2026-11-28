@@ -66,6 +66,10 @@ type Identities struct {
 	LowQuotaPerMin int `yaml:"low_quota_per_min"`
 	Malformed      int `yaml:"malformed"`
 	UnknownAgency  int `yaml:"unknown_agency"`
+	// QuotaTest buyers exist to be pushed past their quota on purpose; the
+	// harness then checks the consumer enforces it exactly (TC-9).
+	QuotaTest       int `yaml:"quota_test"`
+	QuotaTestPerMin int `yaml:"quota_test_per_min"` // default and maximum 100
 }
 
 // Phase is a measured stretch of traffic.
@@ -73,6 +77,9 @@ type Phase struct {
 	Name     string    `yaml:"name"`
 	Duration Duration  `yaml:"duration"`
 	Profiles []Profile `yaml:"profiles"`
+	// StartAtSecond delays the phase until the wall clock reaches this
+	// second of a minute (0-59), e.g. 55 to straddle a quota window.
+	StartAtSecond *int `yaml:"start_at_second"`
 }
 
 // Profile is one traffic stream in a phase.
@@ -82,7 +89,14 @@ type Profile struct {
 	RPS         float64  `yaml:"rps"`
 	Concurrency int      `yaml:"concurrency"`
 	Conditional bool     `yaml:"conditional"`
-	Identities  []string `yaml:"identities"` // kinds: valid, low_quota, malformed, unknown_agency
+	Identities  []string `yaml:"identities"` // kinds: valid, low_quota, malformed, unknown_agency, quota_test
+	// IdentityOffset skips the first n buyers of the pool, and
+	// IdentityLimit then uses at most n of the rest (0: all).
+	IdentityOffset int `yaml:"identity_offset"`
+	IdentityLimit  int `yaml:"identity_limit"`
+	// HonorRetryAfter: after a 429, a buyer waits Retry-After before its
+	// next request, and that request must succeed.
+	HonorRetryAfter bool `yaml:"honor_retry_after"`
 }
 
 // FaultStep installs fault rules at an offset into the measured phases.
@@ -100,6 +114,9 @@ type Thresholds struct {
 	ServerErrorRateMax *float64 `yaml:"server_error_rate_max"`
 	CheckFailuresMax   *int64   `yaml:"check_failures_max"`
 	ClientSaturatedMax *int64   `yaml:"client_saturated_max"`
+	// QuotaViolationsMax bounds early refusals, quota leaks, bad
+	// Retry-After headers and refusals after waiting Retry-After.
+	QuotaViolationsMax *int64   `yaml:"quota_violations_max"`
 	ProjectorLagSMax   *float64 `yaml:"projector_lag_s_max"`
 	DataAgeSMax        *float64 `yaml:"data_age_s_max"`
 	VehicleSuccessMin  *float64 `yaml:"vehicle_collection_success_min"`
@@ -162,6 +179,9 @@ func (s *Scenario) applyDefaults() {
 	if s.Identities.LowQuotaPerMin == 0 {
 		s.Identities.LowQuotaPerMin = 30
 	}
+	if s.Identities.QuotaTestPerMin == 0 {
+		s.Identities.QuotaTestPerMin = load.MaxQuotaPerMin
+	}
 	for i := range s.Phases {
 		for j := range s.Phases[i].Profiles {
 			p := &s.Phases[i].Profiles[j]
@@ -192,8 +212,7 @@ func (s *Scenario) Validate() error {
 	if s.Identities.Valid < 1 {
 		return fmt.Errorf("identities.valid must be >= 1")
 	}
-	counts := map[string]int{load.KindValid: s.Identities.Valid, load.KindLowQuota: s.Identities.LowQuota,
-		load.KindMalformed: s.Identities.Malformed, load.KindUnknownAgency: s.Identities.UnknownAgency}
+	counts := s.identityCounts()
 	for _, ph := range s.Phases {
 		if ph.Name == "" || ph.Duration <= 0 || len(ph.Profiles) == 0 {
 			return fmt.Errorf("phase %q needs a name, a positive duration and at least one profile", ph.Name)
@@ -206,13 +225,52 @@ func (s *Scenario) Validate() error {
 				return fmt.Errorf("phase %q profile %q: rps must be positive", ph.Name, p.Name)
 			}
 			for _, k := range p.Identities {
-				if !slices.Contains([]string{load.KindValid, load.KindLowQuota, load.KindMalformed, load.KindUnknownAgency}, k) {
+				if !slices.Contains([]string{load.KindValid, load.KindLowQuota, load.KindMalformed, load.KindUnknownAgency, load.KindQuotaTest}, k) {
 					return fmt.Errorf("phase %q profile %q: unknown identity kind %q", ph.Name, p.Name, k)
 				}
 				if counts[k] == 0 {
 					return fmt.Errorf("phase %q profile %q uses %q identities but identities.%s is 0", ph.Name, p.Name, k, k)
 				}
 			}
+		}
+	}
+	for _, ph := range s.Phases {
+		if ph.StartAtSecond != nil && (*ph.StartAtSecond < 0 || *ph.StartAtSecond > 59) {
+			return fmt.Errorf("phase %q: start_at_second must be 0..59", ph.Name)
+		}
+		for _, p := range ph.Profiles {
+			if p.IdentityLimit < 0 || p.IdentityOffset < 0 {
+				return fmt.Errorf("phase %q profile %q: identity_offset and identity_limit must be >= 0", ph.Name, p.Name)
+			}
+			pool := 0
+			for _, k := range p.Identities {
+				pool += s.identityCounts()[k]
+			}
+			if p.IdentityOffset >= pool {
+				return fmt.Errorf("phase %q profile %q: identity_offset %d leaves no buyers (pool %d)", ph.Name, p.Name, p.IdentityOffset, pool)
+			}
+			// Quota-test buyers are pushed past their quota on purpose;
+			// keeping them apart from other kinds keeps the other buyers'
+			// results (and the isolation check) clean.
+			if slices.Contains(p.Identities, load.KindQuotaTest) && len(p.Identities) > 1 {
+				return fmt.Errorf("phase %q profile %q: quota_test identities can't share a profile with other kinds", ph.Name, p.Name)
+			}
+		}
+	}
+	if s.Identities.QuotaTestPerMin < 1 || s.Identities.QuotaTestPerMin > load.MaxQuotaPerMin {
+		return fmt.Errorf("identities.quota_test_per_min %d: must be 1..%d (test buyers never get more than %d requests per minute)",
+			s.Identities.QuotaTestPerMin, load.MaxQuotaPerMin, load.MaxQuotaPerMin)
+	}
+	if s.Identities.LowQuotaPerMin < 1 || s.Identities.LowQuotaPerMin > load.MaxQuotaPerMin {
+		return fmt.Errorf("identities.low_quota_per_min %d: must be 1..%d (test buyers never get more than %d requests per minute)",
+			s.Identities.LowQuotaPerMin, load.MaxQuotaPerMin, load.MaxQuotaPerMin)
+	}
+	// Valid buyers get the harness's maximum quota (load.MaxQuotaPerMin);
+	// each must stay under it with headroom, or valid buyers would see 429s.
+	for _, ph := range s.Phases {
+		if perMin := s.ValidPerBuyerPerMin(ph); perMin > MaxValidPerBuyerPerMin {
+			return fmt.Errorf("phase %q: each valid buyer would send %.0f requests per minute, above %d (quota %d with headroom): add valid identities (need at least %d)",
+				ph.Name, perMin, MaxValidPerBuyerPerMin, load.MaxQuotaPerMin, s.validNeeded(ph))
 		}
 	}
 	for i, f := range s.FaultSchedule {
@@ -223,6 +281,55 @@ func (s *Scenario) Validate() error {
 		}
 	}
 	return nil
+}
+
+// MaxValidPerBuyerPerMin is the most requests per minute a scenario may send
+// with one valid buyer: the 100/min quota minus headroom for the limiter's
+// fixed one-minute window and arrival jitter.
+const MaxValidPerBuyerPerMin = 90
+
+// ValidPerBuyerPerMin is the request rate each valid buyer gets in a phase:
+// a profile spreads its rate evenly (round robin) over its identity pool,
+// and a buyer used by several profiles adds up their shares.
+func (s *Scenario) identityCounts() map[string]int {
+	return map[string]int{load.KindValid: s.Identities.Valid, load.KindLowQuota: s.Identities.LowQuota,
+		load.KindMalformed: s.Identities.Malformed, load.KindUnknownAgency: s.Identities.UnknownAgency,
+		load.KindQuotaTest: s.Identities.QuotaTest}
+}
+
+func (s *Scenario) ValidPerBuyerPerMin(ph Phase) float64 {
+	counts := s.identityCounts()
+	var perMin float64
+	for _, p := range ph.Profiles {
+		if !slices.Contains(p.Identities, load.KindValid) {
+			continue
+		}
+		pool := 0
+		for _, k := range p.Identities {
+			pool += counts[k]
+		}
+		pool -= min(p.IdentityOffset, pool)
+		if p.IdentityLimit > 0 {
+			pool = min(pool, p.IdentityLimit)
+		}
+		if pool > 0 {
+			perMin += p.RPS * 60 / float64(pool)
+		}
+	}
+	return perMin
+}
+
+// validNeeded is the fewest valid buyers that keep phase ph under the cap,
+// assuming the other kinds stay as they are.
+func (s *Scenario) validNeeded(ph Phase) int {
+	c := *s
+	for n := s.Identities.Valid; n < 10000; n++ {
+		c.Identities.Valid = n
+		if c.ValidPerBuyerPerMin(ph) <= MaxValidPerBuyerPerMin {
+			return n
+		}
+	}
+	return 10000
 }
 
 // TotalDuration is the sum of the phase durations.

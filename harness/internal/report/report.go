@@ -74,7 +74,7 @@ func (r *Report) Evaluate(t scenario.Thresholds) {
 		r.Checks = append(r.Checks, Check{Name: name, Limit: limit, Actual: actual, Passed: ok})
 	}
 	var minAvail = 1.0
-	var checkFails, saturated, requests, serverErrs int64
+	var checkFails, saturated, requests, serverErrs, quotaViol, quotaJudged int64
 	var rtP95, rtP99, stP95, ageMax float64
 	for _, ph := range r.Phases {
 		for _, p := range ph.Profiles {
@@ -86,6 +86,10 @@ func (r *Report) Evaluate(t scenario.Thresholds) {
 			}
 			saturated += p.ClientSaturated
 			requests += p.Requests
+			if p.Quota != nil {
+				quotaViol += p.Quota.Violations()
+				quotaJudged += p.Quota.Judged
+			}
 			serverErrs += p.ServerErrors
 			switch p.Endpoint {
 			case load.EndpointRealtime:
@@ -120,6 +124,11 @@ func (r *Report) Evaluate(t scenario.Thresholds) {
 	}
 	if v := t.ClientSaturatedMax; v != nil {
 		add("harness saturation (arrivals dropped)", fmt.Sprintf("<= %d", *v), fmt.Sprint(saturated), saturated <= *v)
+	}
+	if v := t.QuotaViolationsMax; v != nil {
+		// No judged requests means the quota wasn't actually tested.
+		add("quota enforcement violations", fmt.Sprintf("<= %d (of %d judged)", *v, quotaJudged), fmt.Sprint(quotaViol),
+			quotaJudged > 0 && quotaViol <= *v)
 	}
 	if v := t.DataAgeSMax; v != nil {
 		add("live-data age (max)", fmt.Sprintf("<= %.0f s", *v), fmt.Sprintf("%.1f s", ageMax), ageMax <= *v)
@@ -210,6 +219,22 @@ func (r *Report) Markdown() string {
 				ph.Name, p.Name, p.Endpoint, p.RPS, p.AchievedRPS, p.Requests, lat, avail,
 				kv(p.Statuses), kv(p.CheckFailures), p.ClientSaturated)
 		}
+	}
+	var quotaRows []string
+	for _, ph := range r.Phases {
+		for _, p := range ph.Profiles {
+			if q := p.Quota; q != nil {
+				quotaRows = append(quotaRows, fmt.Sprintf("| %s | %s | %d/min | %d | %d | %d | %d | **%d** | **%d** | %d | %d / %d | %d |",
+					ph.Name, p.Name, q.Quota, q.Judged, q.Allowed, q.Refused, q.BoundarySkipped, q.EarlyRefusals, q.Leaks,
+					q.RetryAfterBad, q.RetryProbes-q.RefusedAfterWait, q.RetryProbes, q.Deferred))
+			}
+		}
+	}
+	if len(quotaRows) > 0 {
+		b.WriteString("\n\n## Quota enforcement\n\n")
+		fmt.Fprintf(&b, "Each buyer's requests are counted per one-minute window, like the consumer does. Early refusal: 429 before the quota (minus %d in flight). Leak: allowed after the quota (plus %d). Requests within 2 s of a minute boundary aren't judged.\n\n", load.QuotaTolerance, load.QuotaTolerance)
+		b.WriteString("| Phase | Profile | Quota | Judged | Allowed | Refused (429) | Boundary skipped | Early refusals | Leaks | Bad Retry-After | OK after Retry-After | Deferred |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n")
+		b.WriteString(strings.Join(quotaRows, "\n") + "\n")
 	}
 	for _, ph := range r.Phases {
 		for _, p := range ph.Profiles {

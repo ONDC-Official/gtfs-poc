@@ -15,7 +15,8 @@ collector:
   trip_updates_enabled: false
 
 identities:
-  valid: 5
+  # 8 valid buyers keep each under the 100/min test-buyer quota (12 RPS peak)
+  valid: 8
   low_quota: 1
   low_quota_per_min: 10
   malformed: 1

@@ -41,7 +41,9 @@ func Check(endpoint, kind string, resp *http.Response, body []byte, versions *Ve
 			fail("unexpected_status", "unknown agency got %d, want 404", code)
 		}
 		return fails, detail, 0
-	case KindLowQuota:
+	case KindLowQuota, KindQuotaTest:
+		// Whether a 429 was due is the quota tracker's call; here only that
+		// it carries Retry-After.
 		if code == http.StatusTooManyRequests {
 			if resp.Header.Get("Retry-After") == "" {
 				fail("retry_after_missing", "429 without Retry-After")

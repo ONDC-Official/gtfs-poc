@@ -366,6 +366,7 @@ func runDev(ctx context.Context, path, outDir string) (bool, error) {
 	idents, err := load.CreateIdentities(ctx, cfg.ConsumerURL, cfg.AdminKey, load.IdentitySpec{
 		Valid: sc.Identities.Valid, LowQuota: sc.Identities.LowQuota, LowQuotaPerMin: sc.Identities.LowQuotaPerMin,
 		Malformed: sc.Identities.Malformed, UnknownAgency: sc.Identities.UnknownAgency,
+		QuotaTest: sc.Identities.QuotaTest, QuotaTestPerMin: sc.Identities.QuotaTestPerMin,
 		Agencies: ids, RunID: runID,
 	})
 	if err != nil {

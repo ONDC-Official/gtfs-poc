@@ -3,8 +3,10 @@
 # retention), and fresh data returns after recovery.
 #   0:00-0:40  normal
 #   0:40-1:20  every vehicle call answers 503
-#   1:20-2:00  vehicle calls time out (12 s delay, past the 10 s timeout)
-#   2:00-3:00  normal again: data must be fresh again
+#   1:20-2:00  vehicle calls time out (25 s delay, past the collector's
+#              20 s VEHICLE_FETCH_TIMEOUT; the test plan says 10 s)
+#   2:00-4:30  normal again: the collector's backoff (10, 20, 40, 80 s ...)
+#              must end and fresh data return before the run ends
 scenario_id: dev-tc-05-upstream-faults-short
 description: >
   TC-5 short: 503s then timeouts on the vehicle feed, then recovery.
@@ -20,12 +22,12 @@ identities:
 ready_timeout: 6m
 phases:
   - name: faults-and-recovery
-    duration: 3m
+    duration: 4m30s
     profiles:
       - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
 fault_schedule:
   - { at: 40s, rules: [{ endpoint: vehicles, action: status, status: 503 }] }
-  - { at: 80s, rules: [{ endpoint: vehicles, action: delay, delay: 12s }] }
+  - { at: 80s, rules: [{ endpoint: vehicles, action: delay, delay: 25s }] }
   - { at: 120s, rules: [] }
 acceptance_thresholds:
   availability_min: 0.99      # buyers must not see the agency's failure

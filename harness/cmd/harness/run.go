@@ -66,7 +66,8 @@ func run(ctx context.Context, st stack.Stack, path, outDir string) (bool, error)
 	logf("creating buyer identities through the admin API")
 	ids, err := load.CreateIdentities(ctx, stack.ConsumerURL, state.AdminKey, load.IdentitySpec{
 		Valid: sc.Identities.Valid, LowQuota: sc.Identities.LowQuota, LowQuotaPerMin: sc.Identities.LowQuotaPerMin,
-		Malformed: sc.Identities.Malformed, UnknownAgency: sc.Identities.UnknownAgency, Agency: agency, RunID: runID,
+		Malformed: sc.Identities.Malformed, UnknownAgency: sc.Identities.UnknownAgency,
+		QuotaTest: sc.Identities.QuotaTest, QuotaTestPerMin: sc.Identities.QuotaTestPerMin, Agency: agency, RunID: runID,
 	})
 	if err != nil {
 		return false, err
@@ -160,14 +161,19 @@ func envFor(sc *scenario.Scenario) map[string]string {
 func toPhases(sc *scenario.Scenario, ids map[string][]load.Identity, agency string) []load.Phase {
 	var out []load.Phase
 	for _, ph := range sc.Phases {
-		p := load.Phase{Name: ph.Name, Duration: ph.Duration.D()}
+		p := load.Phase{Name: ph.Name, Duration: ph.Duration.D(), StartAtSecond: ph.StartAtSecond}
 		for _, pr := range ph.Profiles {
 			var pool []load.Identity
 			for _, kind := range pr.Identities {
 				pool = append(pool, ids[kind]...)
 			}
+			pool = pool[min(pr.IdentityOffset, len(pool)):]
+			if pr.IdentityLimit > 0 && len(pool) > pr.IdentityLimit {
+				pool = pool[:pr.IdentityLimit]
+			}
 			p.Profiles = append(p.Profiles, load.Profile{Name: pr.Name, Endpoint: pr.Endpoint, Agency: agency,
-				RPS: pr.RPS, Concurrency: pr.Concurrency, Conditional: pr.Conditional, Identities: pool})
+				RPS: pr.RPS, Concurrency: pr.Concurrency, Conditional: pr.Conditional, Identities: pool,
+				HonorRetryAfter: pr.HonorRetryAfter})
 		}
 		out = append(out, p)
 	}

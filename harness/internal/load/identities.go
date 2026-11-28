@@ -11,10 +11,17 @@ import (
 	"time"
 )
 
+// MaxQuotaPerMin is the highest quota the harness ever gives a test buyer:
+// test buyers may send at most 100 requests per minute per agency. Scenarios
+// spread load over enough buyers to stay under it (scenario.Validate).
+const MaxQuotaPerMin = 100
+
 // IdentitySpec is how many buyers of each kind to create.
 type IdentitySpec struct {
 	Valid, LowQuota, Malformed, UnknownAgency int
 	LowQuotaPerMin                            int
+	QuotaTest                                 int
+	QuotaTestPerMin                           int      // default MaxQuotaPerMin
 	Agency                                    string   // grant, when Agencies is empty
 	Agencies                                  []string // grants (dev target: every mock agency)
 	RunID                                     string   // part of every profile name, to find them later
@@ -53,12 +60,16 @@ func CreateIdentities(ctx context.Context, baseURL, adminKey string, spec Identi
 		if resp.StatusCode != http.StatusCreated || created.APIKey == "" {
 			return fmt.Errorf("create %s: HTTP %d %s", name, resp.StatusCode, created.Error)
 		}
-		out[kind] = append(out[kind], Identity{Name: name, Kind: kind, Key: created.APIKey})
+		out[kind] = append(out[kind], Identity{Name: name, Kind: kind, Key: created.APIKey, Quota: quota})
 		return nil
 	}
-	const unlimited = 1_000_000 // the admin API's maximum quota
+	if spec.LowQuotaPerMin < 1 || spec.LowQuotaPerMin > MaxQuotaPerMin {
+		if spec.LowQuota > 0 {
+			return nil, fmt.Errorf("low_quota_per_min %d: must be 1..%d", spec.LowQuotaPerMin, MaxQuotaPerMin)
+		}
+	}
 	for i := range spec.Valid {
-		if err := create(KindValid, i, unlimited); err != nil {
+		if err := create(KindValid, i, MaxQuotaPerMin); err != nil {
 			return nil, err
 		}
 	}
@@ -67,8 +78,20 @@ func CreateIdentities(ctx context.Context, baseURL, adminKey string, spec Identi
 			return nil, err
 		}
 	}
+	qt := spec.QuotaTestPerMin
+	if qt == 0 {
+		qt = MaxQuotaPerMin
+	}
+	if spec.QuotaTest > 0 && (qt < 1 || qt > MaxQuotaPerMin) {
+		return nil, fmt.Errorf("quota_test_per_min %d: must be 1..%d", qt, MaxQuotaPerMin)
+	}
+	for i := range spec.QuotaTest {
+		if err := create(KindQuotaTest, i, qt); err != nil {
+			return nil, err
+		}
+	}
 	for i := range spec.UnknownAgency {
-		if err := create(KindUnknownAgency, i, unlimited); err != nil {
+		if err := create(KindUnknownAgency, i, MaxQuotaPerMin); err != nil {
 			return nil, err
 		}
 	}

@@ -184,6 +184,10 @@ A dev run, entirely through public APIs:
    - the mock forgets them.
 
 **Safety:**
+- **Quota:** every test buyer is created with at most **100 requests per minute** (`load.MaxQuotaPerMin`).
+  - `valid` buyers carry normal load and must stay under it: a scenario is refused if one would need more than 90 a minute (add valid identities to spread the load).
+  - `quota_test` buyers are pushed past it **on purpose** (TC-9). Every response is judged against the harness's own count per one-minute window, and the report's *Quota enforcement* table shows early refusals, leaks, bad `Retry-After` headers, and refusals after waiting `Retry-After`. Threshold: `quota_violations_max`.
+  - Profile options for quota tests: `identity_offset` / `identity_limit` (which buyers), `honor_retry_after`, and on a phase `start_at_second` (e.g. 55 to straddle a window).
 - **Targets:** only `gtfs-dev.ondc.tech` unless `HARNESS_ALLOWED_HOSTS` adds a host.
 - **Agencies:** only `MOCK_` agencies are created or touched.
 - **Secrets:** the admin key comes from the environment only, and tokens are never logged or written to reports.
@@ -196,6 +200,7 @@ A dev run, entirely through public APIs:
 | `tc-02-ramp-short.yaml` | TC-2: three agencies collected in parallel |
 | `tc-05-upstream-faults-short.yaml` | TC-5 agency side: 503s, then timeouts, then recovery |
 | `tc-06-smoke.yaml` | TC-6: every endpoint and access check at low rate |
+| `tc-09-quota-short.yaml` | TC-9: test buyers (100/min) pushed past their quota; enforcement, Retry-After, window boundary, isolation |
 
 **Not yet:**
 - server-side measurements: projector lag, collection success, alerts (G4);

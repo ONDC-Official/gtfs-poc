@@ -1,0 +1,64 @@
+# TC-9 quota short: pushes test buyers past their 100/min quota on purpose
+# and checks the consumer enforces it exactly. Every test buyer is created
+# with quota_per_min 100 (the harness never gives more).
+#
+#   steady breach (3 min)  3 quota_test buyers at 150/min each: per minute,
+#                          about 100 allowed then about 50 refused each, with
+#                          a correct Retry-After; 2 valid buyers alongside at
+#                          60/min must be unaffected (isolation)
+#   burst (10 s)           1 buyer sends 120 requests in 10 s
+#   boundary (10 s)        a fresh buyer, from :55 at 20 RPS: about 100 just before a
+#                          minute boundary and 100 just after. The consumer's
+#                          fixed window allows both; reported, not failed
+#   Retry-After (90 s)     1 buyer at 180/min waits Retry-After after each
+#                          429; its next request must succeed
+#
+# Judged per response (see the report's Quota enforcement table):
+#   early refusal  429 before the quota      -> failure
+#   leak           200 after the quota       -> failure
+#   Retry-After    missing or wrong on a 429 -> failure
+#   after waiting  still 429                 -> failure
+# Dev runs one consumer replica, so the quota is exact there.
+scenario_id: dev-tc-09-quota-short
+description: >
+  TC-9 quota short: test buyers (quota 100/min) pushed past their quota;
+  enforcement, Retry-After and isolation checked.
+seed: 9
+agency_count: 1
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 120
+identities:
+  valid: 2                # isolation: stay at 60/min, must never see 429
+  quota_test: 4           # pushed past the quota; #4 is kept fresh for the boundary phase
+  quota_test_per_min: 100
+ready_timeout: 6m
+phases:
+  - name: steady-breach
+    duration: 3m
+    profiles:
+      - { name: breach-150-per-min, endpoint: realtime, rps: 7.5, concurrency: 8, identities: [quota_test], identity_limit: 3 }
+      - { name: isolation, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: burst
+    duration: 10s
+    profiles:
+      - { name: burst-120-in-10s, endpoint: realtime, rps: 12, concurrency: 8, identities: [quota_test], identity_limit: 1 }
+      - { name: isolation, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: window-boundary
+    start_at_second: 55
+    duration: 10s
+    profiles:
+      - { name: boundary-20rps, endpoint: realtime, rps: 20, concurrency: 10, identities: [quota_test], identity_offset: 3, identity_limit: 1 }
+  - name: honor-retry-after
+    duration: 90s
+    profiles:
+      - { name: retry-after-180-per-min, endpoint: realtime, rps: 3, concurrency: 3, identities: [quota_test], identity_limit: 1, honor_retry_after: true }
+      - { name: isolation, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+acceptance_thresholds:
+  availability_min: 0.99        # valid (isolation) buyers only
+  check_failures_max: 0         # includes the quota failures below
+  quota_violations_max: 0
+  client_saturated_max: 0
+  data_age_s_max: 40

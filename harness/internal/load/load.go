@@ -33,13 +33,21 @@ const (
 	KindLowQuota      = "low_quota"      // 200 / 304, then 429 with Retry-After
 	KindMalformed     = "malformed"      // 403 (unknown or malformed token)
 	KindUnknownAgency = "unknown_agency" // 404 agency_not_found
+	KindQuotaTest     = "quota_test"     // pushed past its quota on purpose; enforcement is checked (QuotaTracker)
 )
+
+// quotaChecked reports whether responses for kind are judged against the
+// buyer's quota. Valid buyers stay under it by design (any 429 is a plain
+// failure); unknown-agency buyers get 404 before the quota is counted.
+func quotaChecked(kind string) bool { return kind == KindLowQuota || kind == KindQuotaTest }
 
 // Identity is one buyer's API key.
 type Identity struct {
 	Name string `json:"name"`
 	Kind string `json:"kind"`
 	Key  string `json:"-"`
+	// Quota is the grant's quota_per_min (0: not checked).
+	Quota int `json:"quota_per_min,omitempty"`
 }
 
 // Profile is one stream of traffic.
@@ -53,6 +61,9 @@ type Profile struct {
 	// like a well-behaved buyer; 304 then counts as success.
 	Conditional bool
 	Identities  []Identity
+	// HonorRetryAfter: after a 429 a buyer waits Retry-After before its next
+	// request, which must then succeed.
+	HonorRetryAfter bool
 }
 
 // Phase runs a set of profiles together for Duration.
@@ -60,6 +71,9 @@ type Phase struct {
 	Name     string
 	Duration time.Duration
 	Profiles []Profile
+	// StartAtSecond (0-59) delays the phase until the wall clock reaches
+	// that second of a minute; nil starts at once.
+	StartAtSecond *int
 }
 
 // Target is the Consumer API under test.
@@ -69,6 +83,8 @@ type Target struct {
 	// Versions gives the static version real-time responses must report;
 	// nil skips that check.
 	Versions *VersionTracker
+	// Quota mirrors the consumer's per-buyer quota windows; nil makes one.
+	Quota *QuotaTracker
 }
 
 // Run executes phases in order and returns one result per phase and profile.
@@ -76,8 +92,22 @@ func Run(ctx context.Context, t Target, phases []Phase) []PhaseResult {
 	if t.Client == nil {
 		t.Client = DefaultClient()
 	}
+	if t.Quota == nil {
+		t.Quota = NewQuotaTracker()
+	}
 	var out []PhaseResult
 	for _, ph := range phases {
+		if at := ph.StartAtSecond; at != nil && *at >= 0 && *at <= 59 {
+			now := time.Now()
+			wait := time.Duration((*at-now.Second()+60)%60)*time.Second - time.Duration(now.Nanosecond())
+			if wait < 0 {
+				wait += time.Minute
+			}
+			select {
+			case <-ctx.Done():
+			case <-time.After(wait):
+			}
+		}
 		pctx, cancel := context.WithTimeout(ctx, ph.Duration)
 		start := time.Now()
 		res := PhaseResult{Name: ph.Name, Start: start}
@@ -139,6 +169,17 @@ func runProfile(ctx context.Context, t Target, p Profile, res *acc) {
 	for ctx.Err() == nil {
 		id := p.Identities[n%len(p.Identities)]
 		n++
+		if p.HonorRetryAfter && t.Quota.waiting(quotaKey(id, p), time.Now()) {
+			res.deferred.Add(1)
+			next = next.Add(interval)
+			if d := time.Until(next); d > 0 {
+				select {
+				case <-ctx.Done():
+				case <-time.After(d):
+				}
+			}
+			continue
+		}
 		select {
 		case jobs <- id:
 		default:
@@ -156,8 +197,11 @@ func runProfile(ctx context.Context, t Target, p Profile, res *acc) {
 	wg.Wait()
 }
 
+func quotaKey(id Identity, p Profile) string { return id.Name + "|" + p.Agency }
+
 // outcome of one request.
 type outcome struct {
+	quota    *quotaResult
 	kind     string
 	status   int // 0 = transport error
 	latency  time.Duration
@@ -187,6 +231,11 @@ func do(ctx context.Context, t Target, p Profile, id Identity, etags map[string]
 		}
 	}
 	start := time.Now()
+	var qs quotaSend
+	checkQuota := quotaChecked(id.Kind) && id.Quota > 0 && t.Quota != nil
+	if checkQuota {
+		qs = t.Quota.send(quotaKey(id, p), start)
+	}
 	resp, err := t.Client.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -208,6 +257,33 @@ func do(ctx context.Context, t Target, p Profile, id Identity, etags map[string]
 		etags[id.Name] = e
 	}
 	o.failures, o.detail, o.dataAge = Check(p.Endpoint, id.Kind, resp, body, t.Versions)
+	if checkQuota {
+		q := judgeQuota(qs, id.Quota, resp)
+		o.quota = &q
+		fail := func(name, format string, args ...any) {
+			o.failures = append(o.failures, name)
+			if o.detail == "" {
+				o.detail = name + ": " + fmt.Sprintf(format, args...)
+			}
+		}
+		switch {
+		case q.early:
+			fail("quota_early_refusal", "%s request %d of %d/min refused at :%02.0f", id.Name, qs.n, id.Quota, qs.second)
+		case q.leak:
+			fail("quota_leak", "%s request %d of %d/min allowed at :%02.0f", id.Name, qs.n, id.Quota, qs.second)
+		}
+		if q.retryBad {
+			fail("retry_after_bad", "429 Retry-After %q at :%02.0f", resp.Header.Get("Retry-After"), qs.second)
+		}
+		if q.refusedAfterWait {
+			fail("refused_after_retry_after", "%s still refused after waiting Retry-After", id.Name)
+		}
+		if p.HonorRetryAfter && q.refused && q.retryAfter > 0 {
+			// Past the boundary zone, so the next request is clearly in the
+			// new window on both clocks.
+			t.Quota.block(quotaKey(id, p), start.Add(q.retryAfter+retryAfterMargin))
+		}
+	}
 	return o
 }
 
@@ -232,6 +308,8 @@ type ProfileResult struct {
 	Availability float64        `json:"availability"`
 	ServerErrors int64          `json:"server_errors"`
 	DataAge      LatencySummary `json:"data_age_s,omitzero"`
+	// Quota is set for profiles whose buyers' quota is checked.
+	Quota *QuotaSummary `json:"quota,omitempty"`
 }
 
 // acc accumulates one profile's outcomes while it runs.
@@ -243,6 +321,8 @@ type acc struct {
 	valid     int64
 	validBad  int64
 	saturated atomic.Int64
+	deferred  atomic.Int64
+	quota     *QuotaSummary
 }
 
 // LatencySummary holds percentiles.
@@ -255,8 +335,15 @@ type LatencySummary struct {
 }
 
 func newAcc(p Profile) *acc {
-	return &acc{r: ProfileResult{Name: p.Name, Endpoint: p.Endpoint, RPS: p.RPS,
+	a := &acc{r: ProfileResult{Name: p.Name, Endpoint: p.Endpoint, RPS: p.RPS,
 		Statuses: map[string]int64{}, ByKind: map[string]int64{}, CheckFailures: map[string]int64{}}}
+	for _, id := range p.Identities {
+		if quotaChecked(id.Kind) && id.Quota > 0 {
+			a.quota = &QuotaSummary{Quota: id.Quota}
+			break
+		}
+	}
+	return a
 }
 
 func (a *acc) record(o outcome) {
@@ -295,6 +382,36 @@ func (a *acc) record(o outcome) {
 	if o.dataAge > 0 {
 		a.ages = append(a.ages, o.dataAge.Seconds())
 	}
+	if q := o.quota; q != nil && a.quota != nil {
+		s := a.quota
+		if q.judged {
+			s.Judged++
+		}
+		if q.boundary {
+			s.BoundarySkipped++
+		}
+		if q.allowed {
+			s.Allowed++
+		}
+		if q.refused {
+			s.Refused++
+		}
+		if q.early {
+			s.EarlyRefusals++
+		}
+		if q.leak {
+			s.Leaks++
+		}
+		if q.retryBad {
+			s.RetryAfterBad++
+		}
+		if q.probe {
+			s.RetryProbes++
+		}
+		if q.refusedAfterWait {
+			s.RefusedAfterWait++
+		}
+	}
 }
 
 func (a *acc) finish(elapsed time.Duration) ProfileResult {
@@ -302,6 +419,11 @@ func (a *acc) finish(elapsed time.Duration) ProfileResult {
 	defer a.mu.Unlock()
 	r := a.r
 	r.ClientSaturated = a.saturated.Load()
+	if a.quota != nil {
+		q := *a.quota
+		q.Deferred = a.deferred.Load()
+		r.Quota = &q
+	}
 	if elapsed > 0 {
 		r.AchievedRPS = round(float64(r.Requests)/elapsed.Seconds(), 2)
 	}
