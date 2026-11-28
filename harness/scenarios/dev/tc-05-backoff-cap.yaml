@@ -1,0 +1,32 @@
+# TC-5 backoff cap: the document's "exponential backoff capped at 5 minutes
+# for RT". The vehicle feed answers 503 for 14 minutes; the collector's
+# retries should spread out 10, 20, 40, 80, 160 s and then stay at 300 s.
+# Retention is 1,200 s so buyers keep the last good data throughout; then
+# 4 minutes normal to see recovery. Gaps between the collector's calls:
+# read from the server's web nginx log until G4 analyses them.
+# Not covered: the 1 h static cap (would need a run of over 2 h).
+scenario_id: dev-tc-05-backoff-cap
+description: >
+  TC-5 backoff cap: 14 minutes of 503s on the vehicle feed, then recovery.
+seed: 52
+agency_count: 1
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 1200
+identities:
+  valid: 2                # 30 requests/min each
+ready_timeout: 6m
+phases:
+  - name: long-outage-and-recovery
+    duration: 18m40s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 1, concurrency: 2, identities: [valid] }
+fault_schedule:
+  - { at: 40s,    rules: [{ endpoint: vehicles, action: status, status: 503 }] }
+  - { at: 14m40s, rules: [] }
+acceptance_thresholds:
+  availability_min: 0.99
+  check_failures_max: 0
+  client_saturated_max: 0

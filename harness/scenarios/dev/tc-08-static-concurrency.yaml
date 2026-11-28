@@ -1,0 +1,89 @@
+# TC-8 static concurrency (document TC-8). Bursts of simultaneous static
+# zip downloads while real-time keeps running at 2 RPS:
+#   3 bursts of 10 at once, 30 s apart, then 3 bursts of 50 at once.
+# Each burst is a 1-second phase at N RPS with N workers, from N different
+# buyers. The mock's zip is ~0.7 MB (a burst of 50 is ~35 MB).
+# Every zip must be complete and valid, the static version the same across
+# a burst, and real-time latency stay within limits during the bursts.
+# Not covered: 100 at once at real size (~15 MB each; too heavy for the
+# shared server), cache behaviour (A3).
+scenario_id: dev-tc-08-static-concurrency
+description: >
+  TC-8 static concurrency: bursts of 10 and 50 simultaneous static
+  downloads with real-time running alongside.
+seed: 81
+agency_count: 1
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 120
+identities:
+  valid: 50               # one buyer per download in the 50-burst
+ready_timeout: 6m
+phases:
+  - name: warmup
+    duration: 30s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: burst-10-1
+    duration: 1s
+    profiles:
+      - { name: static-10-at-once, endpoint: static, rps: 10, concurrency: 10, identities: [valid], identity_limit: 10 }
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: after-burst-10-1
+    duration: 30s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: burst-10-2
+    duration: 1s
+    profiles:
+      - { name: static-10-at-once, endpoint: static, rps: 10, concurrency: 10, identities: [valid], identity_limit: 10 }
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: after-burst-10-2
+    duration: 30s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: burst-10-3
+    duration: 1s
+    profiles:
+      - { name: static-10-at-once, endpoint: static, rps: 10, concurrency: 10, identities: [valid], identity_limit: 10 }
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: after-burst-10-3
+    duration: 30s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: burst-50-1
+    duration: 1s
+    profiles:
+      - { name: static-50-at-once, endpoint: static, rps: 50, concurrency: 50, identities: [valid], identity_limit: 50 }
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: after-burst-50-1
+    duration: 30s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: burst-50-2
+    duration: 1s
+    profiles:
+      - { name: static-50-at-once, endpoint: static, rps: 50, concurrency: 50, identities: [valid], identity_limit: 50 }
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: after-burst-50-2
+    duration: 30s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: burst-50-3
+    duration: 1s
+    profiles:
+      - { name: static-50-at-once, endpoint: static, rps: 50, concurrency: 50, identities: [valid], identity_limit: 50 }
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+  - name: after-burst-50-3
+    duration: 30s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+acceptance_thresholds:
+  availability_min: 0.99
+  realtime_p95_ms_max: 1000
+  static_p95_ms_max: 5000      # 50 parallel downloads over the internet path
+  check_failures_max: 0
+  client_saturated_max: 0
+  data_age_s_max: 60

@@ -1,0 +1,49 @@
+# TC-12 low rate: soak (document TC-12), 4 hours at low steady load
+# instead of 24 h at 70-80 % of target. One phase per hour so the report
+# compares latency, errors and data age hour by hour (they should stay
+# flat). Change the four 1 h phases to run longer.
+# Not covered: memory and goroutine growth, DB growth and index bloat,
+# connection leaks, file descriptors, disk and log volume (internal; G4).
+# Timing: the harness server's certificate (fis-staging.ondc.org) must
+# stay valid for the whole run.
+scenario_id: dev-tc-12-soak-low
+description: >
+  TC-12 low rate: 4-hour soak, 2 agencies, steady low load, compared hour
+  by hour.
+seed: 121
+agency_count: 2
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 120
+identities:
+  valid: 3                # 41 requests/min each
+ready_timeout: 6m
+phases:
+  - name: hour-1
+    duration: 1h
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.05, concurrency: 1, identities: [valid] }
+  - name: hour-2
+    duration: 1h
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.05, concurrency: 1, identities: [valid] }
+  - name: hour-3
+    duration: 1h
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.05, concurrency: 1, identities: [valid] }
+  - name: hour-4
+    duration: 1h
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.05, concurrency: 1, identities: [valid] }
+acceptance_thresholds:
+  availability_min: 0.99
+  realtime_p95_ms_max: 1000
+  check_failures_max: 0
+  client_saturated_max: 0
+  data_age_s_max: 40

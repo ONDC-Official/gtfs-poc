@@ -1,0 +1,81 @@
+# TC-11 low rate: peak-day simulation (document TC-11), 1 hour instead of
+# 4 at full load. Everything together: 3 MOCK_ agencies collected every
+# 10 s, real-time 5 RPS from 8 buyers, static every 5 s, and every 15
+# minutes 5 minutes of quota buyers breaching 100/min (stands in for the
+# document's "quota changes"). A 5-minute 503 outage on the vehicle feed
+# at minute 30. Latency at the end should be no worse than at the start.
+# Retention 600 s covers the outage, so buyers stay available on the last
+# good data; data age is allowed up to 420 s for that window.
+# Not covered: 4 h at target load (bigger machine), trip zones (C2), grant
+# changes (A2).
+scenario_id: dev-tc-11-peak-low
+description: >
+  TC-11 low rate: 1 hour of collection, buyer load, static downloads,
+  quota breaches and a 5-minute agency outage.
+seed: 111
+agency_count: 3
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 600
+identities:
+  valid: 8                # ~39 requests/min each
+  quota_test: 4           # 150/min each during the breach windows
+  quota_test_per_min: 100
+ready_timeout: 6m
+phases:
+  - name: quarter-1
+    duration: 10m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 5, concurrency: 6, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.2, concurrency: 1, identities: [valid] }
+  - name: quarter-1-quota-breach
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 5, concurrency: 6, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.2, concurrency: 1, identities: [valid] }
+      - { name: quota-breach, endpoint: realtime, rps: 10, concurrency: 10, identities: [quota_test] }
+  - name: quarter-2
+    duration: 10m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 5, concurrency: 6, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.2, concurrency: 1, identities: [valid] }
+  - name: quarter-2-quota-breach
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 5, concurrency: 6, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.2, concurrency: 1, identities: [valid] }
+      - { name: quota-breach, endpoint: realtime, rps: 10, concurrency: 10, identities: [quota_test] }
+  - name: quarter-3
+    duration: 10m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 5, concurrency: 6, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.2, concurrency: 1, identities: [valid] }
+  - name: quarter-3-quota-breach
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 5, concurrency: 6, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.2, concurrency: 1, identities: [valid] }
+      - { name: quota-breach, endpoint: realtime, rps: 10, concurrency: 10, identities: [quota_test] }
+  - name: quarter-4
+    duration: 10m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 5, concurrency: 6, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.2, concurrency: 1, identities: [valid] }
+  - name: quarter-4-quota-breach
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 5, concurrency: 6, identities: [valid] }
+      - { name: static, endpoint: static, rps: 0.2, concurrency: 1, identities: [valid] }
+      - { name: quota-breach, endpoint: realtime, rps: 10, concurrency: 10, identities: [quota_test] }
+fault_schedule:
+  - { at: 30m, rules: [{ endpoint: vehicles, action: status, status: 503 }] }
+  - { at: 35m, rules: [] }
+acceptance_thresholds:
+  availability_min: 0.99
+  realtime_p95_ms_max: 1000
+  check_failures_max: 0
+  quota_violations_max: 0
+  client_saturated_max: 0
+  data_age_s_max: 420

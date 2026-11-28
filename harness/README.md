@@ -201,6 +201,17 @@ A dev run, entirely through public APIs:
 | `tc-05-upstream-faults-short.yaml` | TC-5 agency side: 503s, then timeouts, then recovery |
 | `tc-06-smoke.yaml` | TC-6: every endpoint and access check at low rate |
 | `tc-09-quota-short.yaml` | TC-9: test buyers (100/min) pushed past their quota; enforcement, Retry-After, window boundary, isolation |
+| `tc-01-full.yaml` | TC-1 full: the same feed for 30 min (~32 min) |
+| `tc-02-ramp-02.yaml`, `-05`, `-08` | TC-2 ramp steps: 2, 5 and 8 agencies collected in parallel (~5 min each) |
+| `tc-05-faults-extended.yaml` | TC-5: 429, truncated, garbage, empty, dropped, 401 and slow responses, each followed by recovery (~21 min) |
+| `tc-05-backoff-cap.yaml` | TC-5: 14 min of 503s to show the 5-min real-time backoff cap, then recovery (~20 min) |
+| `tc-06-full.yaml` | TC-6 full: 30 min of real-time, static (1 then 5 RPS) and 80/20 mixed load with access checks (~33 min) |
+| `tc-07-ramp-low.yaml` | TC-7 low steps: 5, 10, 20, 40 RPS for 5 min each, 40 repeated twice; 1,000-vehicle feed (~32 min) |
+| `tc-08-static-concurrency.yaml` | TC-8: 3 bursts of 10 and 3 of 50 simultaneous static downloads with real-time alongside (~6 min); creates 50 buyers |
+| `tc-11-peak-low.yaml` | TC-11 low rate: 1 h of 3 agencies, buyer load, static, quota breaches and a 5-min outage (~62 min) |
+| `tc-12-soak-low.yaml` | TC-12 low rate: 4 h soak, compared hour by hour (~4 h) |
+
+Backoff timing in the TC-5 runs isn't analysed by the harness yet (G4): read the gaps between the collector's calls from the server's `web` nginx log (`docker logs delhi-gtfs-web-1 | grep mock-agency/MOCK_01`).
 
 **Not yet:**
 - server-side measurements: projector lag, collection success, alerts (G4);

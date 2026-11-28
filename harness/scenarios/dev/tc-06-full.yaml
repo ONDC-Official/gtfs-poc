@@ -1,0 +1,60 @@
+# TC-6 full: endpoint baseline for 30 minutes (document TC-6). Real-time,
+# static and an 80/20 mix at sustained rates sized for the shared harness
+# server, with access-check buyers running throughout (low quota -> 429,
+# malformed -> 403, unknown agency -> 404). Every response is checked.
+#   0-10 min   real-time 10 RPS (20 % conditional)
+#  10-15 min   static 1 RPS        15-20 min  static 5 RPS
+#  20-30 min   80/20 mix: real-time 12 RPS + static 3 RPS
+# 12 valid buyers keep each at or below 75 requests/min.
+# Not covered: OpenSearch (not part of the system).
+scenario_id: dev-tc-06-full
+description: >
+  TC-6 full: 30 minutes of real-time, static and 80/20 mixed load with
+  access checks throughout.
+seed: 61
+agency_count: 1
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 120
+identities:
+  valid: 12
+  low_quota: 2
+  low_quota_per_min: 10
+  malformed: 1
+  unknown_agency: 1
+ready_timeout: 6m
+phases:
+  - name: realtime
+    duration: 10m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 8, concurrency: 8, identities: [valid] }
+      - { name: rt-conditional, endpoint: realtime, rps: 2, concurrency: 2, conditional: true, identities: [valid] }
+      - { name: access-checks, endpoint: realtime, rps: 1, concurrency: 4, identities: [low_quota, malformed, unknown_agency] }
+  - name: static-1rps
+    duration: 5m
+    profiles:
+      - { name: static, endpoint: static, rps: 0.8, concurrency: 2, identities: [valid] }
+      - { name: static-conditional, endpoint: static, rps: 0.2, concurrency: 1, conditional: true, identities: [valid] }
+      - { name: access-checks, endpoint: static, rps: 1, concurrency: 4, identities: [low_quota, malformed, unknown_agency] }
+  - name: static-5rps
+    duration: 5m
+    profiles:
+      - { name: static, endpoint: static, rps: 4, concurrency: 6, identities: [valid] }
+      - { name: static-conditional, endpoint: static, rps: 1, concurrency: 2, conditional: true, identities: [valid] }
+      - { name: access-checks, endpoint: static, rps: 1, concurrency: 4, identities: [low_quota, malformed, unknown_agency] }
+  - name: mixed-80-20
+    duration: 10m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 12, concurrency: 12, identities: [valid] }
+      - { name: static, endpoint: static, rps: 3, concurrency: 4, identities: [valid] }
+      - { name: access-checks, endpoint: realtime, rps: 1, concurrency: 4, identities: [low_quota, malformed, unknown_agency] }
+acceptance_thresholds:
+  availability_min: 0.99
+  realtime_p95_ms_max: 1000    # internet path
+  realtime_p99_ms_max: 2000
+  static_p95_ms_max: 2000
+  check_failures_max: 0
+  client_saturated_max: 0
+  data_age_s_max: 60

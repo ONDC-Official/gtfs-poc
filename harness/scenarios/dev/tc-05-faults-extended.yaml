@@ -1,0 +1,55 @@
+# TC-5 extended: every agency-side failure in the document (TC-5 and the
+# failure matrix's 429/5xx row), one at a time, each followed by recovery.
+# Each fault lasts 40 s, then 100 s normal (past the collector's 80 s
+# backoff step) so it recovers before the next one:
+#   0:40  429 rate limited          2:20  ok
+#   3:00  truncated body            4:40  ok
+#   5:20  garbage body              7:00  ok
+#   7:40  empty body                9:20  ok
+#  10:00  dropped connection       11:40  ok
+#  12:20  BMTC 401 "Invalid Token" 14:00  ok
+#  14:40  slow body, 25 s (> the collector's 20 s timeout)
+#  15:20  ok until the end (19:30)
+# Buyers must stay 100 % available on the last good data (retention 300 s)
+# and bad data must never reach them. Backoff timing: read from the server's
+# web nginx log until G4 analyses it.
+# Not covered: a malformed static file (needs a static bump step), stopping
+# the mock entirely (the dropped connection covers network loss).
+scenario_id: dev-tc-05-faults-extended
+description: >
+  TC-5 extended: 429, truncated, garbage, empty, dropped, 401 and slow
+  responses on the vehicle feed, each followed by recovery.
+seed: 51
+agency_count: 1
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 300
+identities:
+  valid: 3                # 40 requests/min each
+ready_timeout: 6m
+phases:
+  - name: faults-and-recovery
+    duration: 19m30s
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 2, concurrency: 2, identities: [valid] }
+fault_schedule:
+  - { at: 40s,     rules: [{ endpoint: vehicles, action: status, status: 429 }] }
+  - { at: 80s,     rules: [] }
+  - { at: 3m,      rules: [{ endpoint: vehicles, action: malformed, mode: truncate }] }
+  - { at: 3m40s,   rules: [] }
+  - { at: 5m20s,   rules: [{ endpoint: vehicles, action: malformed, mode: garbage }] }
+  - { at: 6m,      rules: [] }
+  - { at: 7m40s,   rules: [{ endpoint: vehicles, action: malformed, mode: empty }] }
+  - { at: 8m20s,   rules: [] }
+  - { at: 10m,     rules: [{ endpoint: vehicles, action: drop }] }
+  - { at: 10m40s,  rules: [] }
+  - { at: 12m20s,  rules: [{ endpoint: vehicles, action: auth }] }
+  - { at: 13m,     rules: [] }
+  - { at: 14m40s,  rules: [{ endpoint: vehicles, action: trickle, delay: 25s }] }
+  - { at: 15m20s,  rules: [] }
+acceptance_thresholds:
+  availability_min: 0.99
+  check_failures_max: 0
+  client_saturated_max: 0

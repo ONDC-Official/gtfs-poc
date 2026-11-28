@@ -1,0 +1,55 @@
+# TC-7 low steps: consumer ramp (document TC-7). Real-time load in 5-minute
+# steps 5 -> 10 -> 20 -> 40 RPS, then the last step repeated twice more
+# (the document asks to repeat the last passing step 3 times).
+# 1,000 vehicles per feed (~70 KB per response) so the harness server's
+# download (~22 Mbit/s at 40 RPS) isn't the limit; with 7,000 it would be
+# ~160 Mbit/s. 30 valid buyers keep each at or below 80 requests/min.
+# Harness saturation shows when the server, not dev, is the limit.
+# Not covered: steps beyond ~40 RPS (needs a bigger machine), dev's CPU,
+# memory and DB pool (G4), cache hit rate (A3).
+scenario_id: dev-tc-07-ramp-low
+description: >
+  TC-7 low steps: real-time 5, 10, 20, 40 RPS for 5 minutes each, the
+  40 RPS step repeated twice.
+seed: 71
+agency_count: 1
+upstream:
+  vehicle_entities: 1000
+collector:
+  collector_interval_s: 10
+  retention_s: 120
+identities:
+  valid: 30
+ready_timeout: 6m
+phases:
+  - name: step-05rps
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 5, concurrency: 10, identities: [valid] }
+  - name: step-10rps
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 10, concurrency: 15, identities: [valid] }
+  - name: step-20rps
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 20, concurrency: 25, identities: [valid] }
+  - name: step-40rps
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 40, concurrency: 40, identities: [valid] }
+  - name: step-40rps-repeat-2
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 40, concurrency: 40, identities: [valid] }
+  - name: step-40rps-repeat-3
+    duration: 5m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 40, concurrency: 40, identities: [valid] }
+acceptance_thresholds:
+  availability_min: 0.99
+  realtime_p95_ms_max: 1000
+  realtime_p99_ms_max: 2000
+  check_failures_max: 0
+  client_saturated_max: 0
+  data_age_s_max: 60

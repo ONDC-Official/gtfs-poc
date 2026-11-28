@@ -1,0 +1,31 @@
+# TC-2 ramp, step 5 agencies (document TC-2: 1 -> 2 -> 5 -> 10 -> 25).
+# 5 MOCK_ agencies, each 7,000 vehicles every 10 s with its own token;
+# buyers have grants to all of them, load on MOCK_01. The mock counts each
+# agency's polls: each should be polled ~18 times in 3 min with no failures.
+# Compare the 2, 5 and 8 steps for cadence or freshness slipping.
+# Not covered: 10 and 25 agencies (too much for the shared 2-vCPU server),
+# DB CPU, pool and lock waits (internal; needs G4).
+scenario_id: dev-tc-02-ramp-05
+description: >
+  TC-2 ramp step: 5 mock agencies collected in parallel at a 10 s cadence.
+seed: 205
+agency_count: 5
+upstream:
+  vehicle_entities: 7000
+collector:
+  collector_interval_s: 10
+  retention_s: 120
+identities:
+  valid: 3                # 60 requests/min each
+ready_timeout: 6m
+phases:
+  - name: agencies-05
+    duration: 3m
+    profiles:
+      - { name: rt, endpoint: realtime, rps: 3, concurrency: 3, identities: [valid] }
+acceptance_thresholds:
+  availability_min: 0.99
+  realtime_p95_ms_max: 1000
+  check_failures_max: 0
+  client_saturated_max: 0
+  data_age_s_max: 40
